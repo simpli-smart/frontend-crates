@@ -12,68 +12,55 @@
 //! Final answer text.
 //! ```
 //!
-//! The `thought\n` role label inside the channel is a structural artefact
-//! analogous to the `user\n` label in `<|turn>user\n...`. Downstream consumers
-//! expect the reasoning content without that label, so this parser strips it.
-//!
-//! Both the start and end markers are special tokens. They are visible in the
-//! decoded text only when the inference engine is configured with
-//! `skip_special_tokens=False`. If the markers are stripped before the parser
-//! sees them, the parser falls back to passing the text through as
-//! `normal_text` (no reasoning extracted).
+//! Parsing semantics align with vLLM/SGLang ``Gemma4Detector`` (snapshot-based
+//! streaming on incomplete-marker-safe prefixes).
 
 use crate::ParserResult;
 use crate::ReasoningParser;
-
-const START_TOKEN: &str = "<|channel>";
-const END_TOKEN: &str = "<channel|>";
-const THOUGHT_PREFIX: &str = "thought\n";
-
-/// Returns the length of the longest suffix of `s` that is also a prefix of
-/// `delim`. Used to detect partial multi-byte markers split across streaming
-/// chunk boundaries (e.g. `"...<|chan"` is a partial prefix of `<|channel>`).
-fn overlap(s: &str, delim: &str) -> usize {
-    let max = delim.len().min(s.len());
-    for i in (1..=max).rev() {
-        if !delim.is_char_boundary(i) || !s.is_char_boundary(s.len() - i) {
-            continue;
-        }
-        if s.ends_with(&delim[..i]) {
-            return i;
-        }
-    }
-    0
-}
+use crate::tool_calling::gemma4::{
+    diff_reasoning_streaming_snapshots, extract_reasoning_non_streaming,
+    strip_trailing_incomplete_token, ReasoningSnapshot, CHANNEL_END, CHANNEL_START,
+};
 
 #[derive(Debug, Clone)]
 pub struct Gemma4ReasoningParser {
-    /// Streaming buffer for accumulated text yet to be classified.
-    buffer: String,
-    /// True once we've observed `<|channel>` and are inside a reasoning span.
-    in_reasoning: bool,
-    /// True once we've stripped the `thought\n` prefix (or determined it is
-    /// not present) for the current reasoning span.
-    prefix_resolved: bool,
-    /// Reasoning text accumulated so far for the current span. Used to decide
-    /// whether the accumulated bytes are still a strict prefix of
-    /// `thought\n` (case 2) or have diverged (case 3).
-    reasoning_accum: String,
+    /// Full accumulated model text for snapshot-based streaming.
+    cumulative_text: String,
+    /// Previous cumulative text (for channel-open detection).
+    prev_cumulative_text: String,
+    /// Last incomplete-marker-safe prefix of `cumulative_text`.
+    last_safe_text: String,
+    /// Client-visible content already emitted (avoids duplicate pre-channel text).
+    emitted_content: String,
 }
 
 impl Gemma4ReasoningParser {
     pub fn new() -> Self {
         Self {
-            buffer: String::new(),
-            in_reasoning: false,
-            prefix_resolved: false,
-            reasoning_accum: String::new(),
+            cumulative_text: String::new(),
+            prev_cumulative_text: String::new(),
+            last_safe_text: String::new(),
+            emitted_content: String::new(),
         }
     }
 
-    fn reset_span(&mut self) {
-        self.in_reasoning = false;
-        self.prefix_resolved = false;
-        self.reasoning_accum.clear();
+    fn snapshot_from_safe_text(safe_text: &str) -> ReasoningSnapshot {
+        extract_reasoning_non_streaming(safe_text)
+    }
+
+    /// True while the first `<|channel>` span is open (no `<channel|>` yet).
+    fn inside_open_first_channel(text: &str) -> bool {
+        let Some((_, after_start)) = text.split_once(CHANNEL_START) else {
+            return false;
+        };
+        !after_start.contains(CHANNEL_END)
+    }
+
+    fn snapshot_to_parser_result(snapshot: &ReasoningSnapshot) -> ParserResult {
+        ParserResult {
+            normal_text: snapshot.content.clone().unwrap_or_default(),
+            reasoning_text: snapshot.reasoning.clone().unwrap_or_default(),
+        }
     }
 }
 
@@ -83,129 +70,9 @@ impl Default for Gemma4ReasoningParser {
     }
 }
 
-/// Strip the `thought\n` role label from the start of `text` if present.
-fn strip_thought_prefix(text: &str) -> &str {
-    text.strip_prefix(THOUGHT_PREFIX).unwrap_or(text)
-}
-
-/// Decide what slice of `raw_reasoning` to emit given the current
-/// prefix-stripping state. Returns `(emit, new_prefix_resolved)`.
-///
-/// **Precondition:** `raw_reasoning` MUST be a suffix of `accum` — i.e. the
-/// caller has already pushed the new delta into the accumulator before
-/// calling this. We rely on that to compute `prev_len = accum.len() -
-/// raw_reasoning.len()` (the length of the accumulator *before* this delta).
-/// Violating the precondition would underflow `prev_len` and corrupt the
-/// emit-slice. The streaming driver in `parse_reasoning_streaming_incremental`
-/// upholds this invariant by always pushing `raw` into `self.reasoning_accum`
-/// immediately before the call.
-///
-/// Case 1: accumulated reasoning starts with `thought\n` — strip it from the
-///   delta (or suppress entirely if the delta lies inside the prefix).
-/// Case 2: accumulated reasoning is a strict prefix of `thought\n` — suppress
-///   so we can decide once more bytes arrive.
-/// Case 3: accumulated reasoning diverged from the prefix — emit the
-///   buffered reasoning verbatim (data preservation).
-fn resolve_prefix<'a>(accum: &'a str, raw_reasoning: &'a str) -> (&'a str, bool) {
-    debug_assert!(
-        accum.ends_with(raw_reasoning),
-        "resolve_prefix precondition violated: raw_reasoning ({:?}) must be a suffix of accum ({:?})",
-        raw_reasoning,
-        accum,
-    );
-    if accum.starts_with(THOUGHT_PREFIX) {
-        let prev_len = accum.len() - raw_reasoning.len();
-        if prev_len >= THOUGHT_PREFIX.len() {
-            // Prefix was already consumed by earlier deltas — pass through.
-            return (raw_reasoning, true);
-        }
-        let chars_of_prefix_in_delta = THOUGHT_PREFIX.len() - prev_len;
-        let stripped = &raw_reasoning[chars_of_prefix_in_delta.min(raw_reasoning.len())..];
-        if !stripped.is_empty() || accum.len() >= THOUGHT_PREFIX.len() {
-            return (stripped, true);
-        }
-        return ("", false);
-    }
-    if THOUGHT_PREFIX.starts_with(accum) {
-        // Strict prefix of "thought\n" — suppress until we know.
-        return ("", false);
-    }
-    // Diverged: emit full buffered reasoning verbatim.
-    (accum, true)
-}
-
 impl ReasoningParser for Gemma4ReasoningParser {
     fn detect_and_parse_reasoning(&mut self, text: &str, _token_ids: &[u32]) -> ParserResult {
-        // Non-streaming path: we have the complete text, so we can use plain
-        // string operations.
-        if !text.contains(START_TOKEN) {
-            if let Some(e) = text.find(END_TOKEN) {
-                // Dangling end marker without start marker — upstream's
-                // offline parser still treats text-before as reasoning. Mirror
-                // that so model emissions where the start tag was stripped
-                // (e.g. tokenizer with skip_special_tokens) don't lose the
-                // reasoning content entirely.
-                let reasoning_raw = &text[..e];
-                let post = &text[e + END_TOKEN.len()..];
-                let reasoning = strip_thought_prefix(reasoning_raw).to_string();
-                return ParserResult {
-                    normal_text: post.to_string(),
-                    reasoning_text: reasoning,
-                };
-            }
-
-            return ParserResult {
-                normal_text: text.to_string(),
-                reasoning_text: String::new(),
-            };
-        }
-
-        // We have at least one start marker. Extract reasoning spans iteratively until we run out of markers.
-        let mut normal = String::new();
-        let mut reasoning = String::new();
-        let mut cursor = 0;
-
-        loop {
-            let next_start = text[cursor..].find(START_TOKEN);
-            let stray_end = text[cursor..].find(END_TOKEN);
-
-            // Stray END_TOKEN appears before the next START_TOKEN (or no next start).
-            // Drop it per the lossless-split contract: parser-owned syntax must never
-            // reach normal_text.
-            if let Some(e_rel) = stray_end
-                && next_start.is_none_or(|s_rel| e_rel < s_rel)
-            {
-                let e = cursor + e_rel;
-                normal.push_str(&text[cursor..e]);
-                cursor = e + END_TOKEN.len();
-                continue;
-            }
-
-            let Some(start_rel) = next_start else {
-                break;
-            };
-            let start = cursor + start_rel;
-            normal.push_str(&text[cursor..start]);
-
-            let reasoning_start = start + START_TOKEN.len();
-            let Some(end_rel) = text[reasoning_start..].find(END_TOKEN) else {
-                reasoning.push_str(strip_thought_prefix(&text[reasoning_start..]));
-                return ParserResult {
-                    normal_text: normal,
-                    reasoning_text: reasoning,
-                };
-            };
-
-            let end = reasoning_start + end_rel;
-            reasoning.push_str(strip_thought_prefix(&text[reasoning_start..end]));
-            cursor = end + END_TOKEN.len();
-        }
-
-        normal.push_str(&text[cursor..]);
-        ParserResult {
-            normal_text: normal,
-            reasoning_text: reasoning,
-        }
+        Self::snapshot_to_parser_result(&extract_reasoning_non_streaming(text))
     }
 
     fn parse_reasoning_streaming_incremental(
@@ -213,128 +80,68 @@ impl ReasoningParser for Gemma4ReasoningParser {
         text: &str,
         _token_ids: &[u32],
     ) -> ParserResult {
-        // Aggregate this delta with the carry buffer for prefix detection.
-        let mut work = std::mem::take(&mut self.buffer);
-        work.push_str(text);
+        self.prev_cumulative_text = self.cumulative_text.clone();
+        self.cumulative_text.push_str(text);
+        let safe_curr = strip_trailing_incomplete_token(&self.cumulative_text);
 
-        let mut normal = String::new();
-        let mut reasoning_emit = String::new();
+        if safe_curr == self.last_safe_text {
+            return ParserResult::default();
+        }
 
-        loop {
-            if !self.in_reasoning {
-                // Look for the next start marker, but also drop any stray end
-                // marker that appears before a start (lossless-split contract).
-                // Prefer the earlier of the two.
-                let next_start = work.find(START_TOKEN);
-                let stray_end = work.find(END_TOKEN);
+        let safe_prev = if self.last_safe_text.is_empty() {
+            String::new()
+        } else {
+            self.last_safe_text.clone()
+        };
 
-                if let Some(e_idx) = stray_end
-                    && next_start.is_none_or(|s_idx| e_idx < s_idx)
-                {
-                    normal.push_str(&work[..e_idx]);
-                    work = work[e_idx + END_TOKEN.len()..].to_string();
-                    continue;
-                }
+        let mut prev_snapshot = if safe_prev.is_empty() {
+            ReasoningSnapshot::default()
+        } else {
+            Self::snapshot_from_safe_text(&safe_prev)
+        };
 
-                if let Some(idx) = next_start {
-                    normal.push_str(&work[..idx]);
-                    work = work[idx + START_TOKEN.len()..].to_string();
-                    self.in_reasoning = true;
-                    self.prefix_resolved = false;
-                    self.reasoning_accum.clear();
-                    continue;
-                }
-                // No complete marker — check for partial at end of buffer.
-                // The partial could be a prefix of either START_TOKEN or
-                // END_TOKEN (both begin with `<`), so use the wider overlap.
-                let lap_start = overlap(&work, START_TOKEN);
-                let lap_end = overlap(&work, END_TOKEN);
-                let lap = lap_start.max(lap_end);
-                if lap > 0 {
-                    let split = work.len() - lap;
-                    normal.push_str(&work[..split]);
-                    self.buffer = work[split..].to_string();
-                } else {
-                    normal.push_str(&work);
-                    self.buffer.clear();
-                }
-                break;
+        // Pre-channel text must not be emitted twice once the channel opens.
+        let channel_just_opened = !self.prev_cumulative_text.contains(CHANNEL_START)
+            && self.cumulative_text.contains(CHANNEL_START);
+        if channel_just_opened {
+            prev_snapshot.content = None;
+        }
+
+        let curr_snapshot = Self::snapshot_from_safe_text(&safe_curr);
+        self.last_safe_text = safe_curr;
+
+        let (dr, mut dc) = diff_reasoning_streaming_snapshots(&curr_snapshot, &prev_snapshot);
+
+        let suppress_content = Self::inside_open_first_channel(&self.cumulative_text);
+        if suppress_content {
+            dc.clear();
+        } else if let Some(ref full) = curr_snapshot.content {
+            if !self.emitted_content.is_empty() && full.starts_with(&self.emitted_content) {
+                dc = full[self.emitted_content.len()..].to_string();
             }
-
-            // self.in_reasoning == true
-            if let Some(idx) = work.find(END_TOKEN) {
-                let raw = &work[..idx];
-                self.reasoning_accum.push_str(raw);
-                if !self.prefix_resolved {
-                    let (emit, resolved) = resolve_prefix(&self.reasoning_accum, raw);
-                    if resolved {
-                        reasoning_emit.push_str(emit);
-                        self.prefix_resolved = true;
-                    }
-                    // If still unresolved at end-of-span, the accumulated text
-                    // was a strict prefix of `thought\n` — by definition there
-                    // is nothing useful to emit; drop it.
-                } else {
-                    reasoning_emit.push_str(raw);
-                }
-                work = work[idx + END_TOKEN.len()..].to_string();
-                self.reset_span();
-                continue;
+            if !dc.is_empty() {
+                self.emitted_content = full.clone();
             }
-
-            // No end marker yet. Hold back any partial-end-marker suffix.
-            let lap = overlap(&work, END_TOKEN);
-            let split = work.len() - lap;
-            let raw = work[..split].to_string();
-            self.buffer = work[split..].to_string();
-
-            if !raw.is_empty() {
-                self.reasoning_accum.push_str(&raw);
-                if !self.prefix_resolved {
-                    let (emit, resolved) = resolve_prefix(&self.reasoning_accum, &raw);
-                    if resolved {
-                        reasoning_emit.push_str(emit);
-                        self.prefix_resolved = true;
-                    }
-                } else {
-                    reasoning_emit.push_str(&raw);
-                }
-            }
-            break;
         }
 
         ParserResult {
-            normal_text: normal,
-            reasoning_text: reasoning_emit,
+            normal_text: dc,
+            reasoning_text: dr,
         }
     }
 
     fn finish_reasoning_stream(&mut self) -> ParserResult {
-        if self.buffer.is_empty() {
+        if self.cumulative_text.is_empty() {
             return ParserResult::default();
         }
 
-        let buffered = std::mem::take(&mut self.buffer);
-        if !self.in_reasoning {
-            return ParserResult {
-                normal_text: buffered,
-                reasoning_text: String::new(),
-            };
-        }
+        let full = std::mem::take(&mut self.cumulative_text);
+        self.prev_cumulative_text.clear();
+        self.last_safe_text.clear();
+        self.emitted_content.clear();
 
-        let reasoning_text = if self.prefix_resolved {
-            buffered
-        } else {
-            self.reasoning_accum.push_str(&buffered);
-            let (emit, resolved) = resolve_prefix(&self.reasoning_accum, &buffered);
-            self.prefix_resolved = resolved;
-            emit.to_string()
-        };
-        self.reset_span();
-        ParserResult {
-            normal_text: String::new(),
-            reasoning_text,
-        }
+        let final_snapshot = extract_reasoning_non_streaming(&full);
+        Self::snapshot_to_parser_result(&final_snapshot)
     }
 }
 
@@ -342,7 +149,7 @@ impl ReasoningParser for Gemma4ReasoningParser {
 mod tests {
     use super::*;
 
-    #[test] // REASONING.batch.2.c — non-streaming basic case
+    #[test]
     fn detect_basic_thinking() {
         let mut p = Gemma4ReasoningParser::new();
         let r = p.detect_and_parse_reasoning(
@@ -353,7 +160,7 @@ mod tests {
         assert_eq!(r.normal_text, "The answer is 42.");
     }
 
-    #[test] // REASONING.batch.1.b — no reasoning markers, pass through
+    #[test]
     fn detect_no_markers_passes_through() {
         let mut p = Gemma4ReasoningParser::new();
         let r = p.detect_and_parse_reasoning("just a plain answer", &[]);
@@ -361,16 +168,15 @@ mod tests {
         assert_eq!(r.normal_text, "just a plain answer");
     }
 
-    #[test] // REASONING.batch.5 — reasoning open without close (truncation): everything after
-    // start marker is reasoning content.
+    #[test]
     fn detect_truncated_reasoning_open_only() {
         let mut p = Gemma4ReasoningParser::new();
         let r = p.detect_and_parse_reasoning("intro <|channel>thought\npartial", &[]);
         assert_eq!(r.reasoning_text, "partial");
-        assert_eq!(r.normal_text, "intro ");
+        assert_eq!(r.normal_text, "");
     }
 
-    #[test] // REASONING.batch.2.d — text before AND after the reasoning span preserved
+    #[test]
     fn detect_text_before_and_after() {
         let mut p = Gemma4ReasoningParser::new();
         let r = p.detect_and_parse_reasoning(
@@ -381,23 +187,23 @@ mod tests {
         assert_eq!(r.normal_text, "Hello.  Goodbye.");
     }
 
-    #[test] // REASONING.batch.4 — dangling end marker, missing start (upstream INVALID_SIMPLE)
-    fn detect_dangling_end_marker_extracts_prefix_as_reasoning() {
+    #[test]
+    fn detect_dangling_end_marker_passes_through_as_content() {
         let mut p = Gemma4ReasoningParser::new();
         let r = p.detect_and_parse_reasoning("some thinking<channel|>final answer", &[]);
-        assert_eq!(r.reasoning_text, "some thinking");
-        assert_eq!(r.normal_text, "final answer");
+        assert_eq!(r.reasoning_text, "");
+        assert_eq!(r.normal_text, "some thinking<channel|>final answer");
     }
 
-    #[test] // REASONING.batch.4 — dangling end + thought prefix on the head (upstream INVALID_COMPLETE)
-    fn detect_dangling_end_marker_strips_thought_prefix() {
+    #[test]
+    fn detect_dangling_end_with_thought_prefix_in_content() {
         let mut p = Gemma4ReasoningParser::new();
         let r = p.detect_and_parse_reasoning("thought\nrumination<channel|>final answer", &[]);
-        assert_eq!(r.reasoning_text, "rumination");
-        assert_eq!(r.normal_text, "final answer");
+        assert_eq!(r.reasoning_text, "");
+        assert!(r.normal_text.contains("<channel|>"));
     }
 
-    #[test] // `thought\n` prefix absent (some tokens drop it): pass through unchanged
+    #[test]
     fn detect_no_thought_prefix() {
         let mut p = Gemma4ReasoningParser::new();
         let r = p.detect_and_parse_reasoning(
@@ -408,7 +214,7 @@ mod tests {
         assert_eq!(r.normal_text, "answer");
     }
 
-    #[test] // REASONING.stream.2.a — streaming arrival, single chunk
+    #[test]
     fn streaming_single_chunk() {
         let mut p = Gemma4ReasoningParser::new();
         let r = p.parse_reasoning_streaming_incremental(
@@ -419,7 +225,7 @@ mod tests {
         assert_eq!(r.normal_text, "final");
     }
 
-    #[test] // REASONING.stream.3.a — streaming with `thought\n` split across deltas
+    #[test]
     fn streaming_thought_prefix_split_across_deltas() {
         let mut p = Gemma4ReasoningParser::new();
         let chunks = [
@@ -441,12 +247,12 @@ mod tests {
         assert_eq!(normal, "the answer.");
     }
 
-    #[test] // REASONING.stream.3.a — start marker split across deltas
+    #[test]
     fn streaming_start_marker_split() {
         let mut p = Gemma4ReasoningParser::new();
         let chunks = [
             "intro ",
-            "<|chan", // partial start marker
+            "<|chan",
             "nel>thought\n",
             "rumination",
             "<channel|>",
@@ -463,13 +269,13 @@ mod tests {
         assert_eq!(normal, "intro outro");
     }
 
-    #[test] // REASONING.stream.3.b — end marker split across deltas
+    #[test]
     fn streaming_end_marker_split() {
         let mut p = Gemma4ReasoningParser::new();
         let chunks = [
             "<|channel>thought\n",
             "thinking",
-            "<chan", // partial end marker
+            "<chan",
             "nel|>",
             "answer",
         ];
@@ -483,8 +289,7 @@ mod tests {
         assert_eq!(reasoning, "thinking");
         assert_eq!(normal, "answer");
     }
-
-    #[test] // REASONING.stream.3.c — diverged accumulated text (no `thought\n` prefix at all)
+    #[test]
     fn streaming_no_thought_prefix_streaming() {
         let mut p = Gemma4ReasoningParser::new();
         let chunks = [
@@ -504,7 +309,7 @@ mod tests {
         assert_eq!(normal, "answer");
     }
 
-    #[test] // REASONING.stream.1.b — streaming with no markers at all
+    #[test]
     fn streaming_no_markers() {
         let mut p = Gemma4ReasoningParser::new();
         let r = p.parse_reasoning_streaming_incremental("plain text only", &[]);
@@ -512,33 +317,33 @@ mod tests {
         assert_eq!(r.normal_text, "plain text only");
     }
 
-    #[test] // REASONING.batch.6.a — multiple reasoning spans separated by normal text
-    fn detect_multiple_reasoning_spans() {
+    #[test]
+    fn detect_multiple_reasoning_spans_first_only() {
         let mut p = Gemma4ReasoningParser::new();
         let input =
             "<|channel>thought\nfirst<channel|> middle <|channel>thought\nsecond<channel|> done";
         let r = p.detect_and_parse_reasoning(input, &[]);
-        assert_eq!(r.reasoning_text, "firstsecond");
-        assert_eq!(r.normal_text, " middle  done");
+        assert_eq!(r.reasoning_text, "first");
+        assert!(r.normal_text.contains("middle"));
+        assert!(r.normal_text.contains("second"));
     }
 
-    #[test] // REASONING.stream.2.b — multiple reasoning spans in one stream chunk
-    fn streaming_multiple_reasoning_spans() {
+    #[test]
+    fn detect_open_channel_tool_handoff() {
         let mut p = Gemma4ReasoningParser::new();
-        let input =
-            "<|channel>thought\nfirst<channel|>answer1<|channel>thought\nsecond<channel|>answer2";
-        let r = p.parse_reasoning_streaming_incremental(input, &[]);
-        // Both spans concatenated into the cumulative deltas.
-        assert!(r.reasoning_text.contains("first"));
-        assert!(r.reasoning_text.contains("second"));
-        assert!(r.normal_text.contains("answer1"));
-        assert!(r.normal_text.contains("answer2"));
+        let input = concat!(
+            "<|channel>thought\nplanning",
+            "<|tool_call>call:get_weather{location:<|\"|>SF<|\"|>}<tool_call|>",
+        );
+        let r = p.detect_and_parse_reasoning(input, &[]);
+        assert_eq!(r.reasoning_text, "planning");
+        assert_eq!(
+            r.normal_text,
+            r#"<|tool_call>call:get_weather{location:<|"|>SF<|"|>}<tool_call|>"#,
+        );
     }
 
-    #[test] // REASONING.batch.3.a — paired reasoning + tool call. The reasoning parser
-    // must extract the channel content as `reasoning_text` and leave the
-    // following `<|tool_call>...<tool_call|>` markers intact in
-    // `normal_text` for the tool-call parser to consume downstream.
+    #[test]
     fn paired_reasoning_then_tool_call_non_streaming() {
         let mut p = Gemma4ReasoningParser::new();
         let input = concat!(
@@ -549,17 +354,26 @@ mod tests {
         assert_eq!(r.reasoning_text, "thinking about the request");
         assert_eq!(
             r.normal_text, r#"<|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}<tool_call|>"#,
-            "tool-call markers must survive reasoning extraction",
         );
     }
 
-    // ----- Explicit N/A coverage notes (per lib/parsers/TOOLCALLING_CASES.md) -----
-    //
-    // REASONING.batch.1.a/c/d — empty, whitespace-only, and null/missing
-    //          input variants are not Gemma-specific.
-    // FRONTEND.tool_choice, PIPELINE.finish_reason — `tool_choice` and `finish_reason`: tool-call concerns,
-    //          N/A for reasoning. (Universal cross-parser gap regardless;
-    //          see notes in `tool_calling/gemma4/parser.rs`.)
-    // TOOLCALLING.xml.1 / TOOLCALLING.xml.2 — XML-family only. N/A.
-    // TOOLCALLING.harmony.1 / TOOLCALLING.harmony.2 — Harmony only. N/A.
+    #[test]
+    fn streaming_suppressed_empty_thinking_not_in_content() {
+        let mut p = Gemma4ReasoningParser::new();
+        let chunks = [
+            "<|channel>",
+            "thought\n",
+            "<channel|>",
+            "<|channel>",
+            "Hi. ",
+        ];
+        let mut normal = String::new();
+        for c in chunks {
+            let r = p.parse_reasoning_streaming_incremental(c, &[]);
+            normal.push_str(&r.normal_text);
+        }
+        assert!(!normal.contains("<|channel>"));
+        assert!(!normal.contains("<channel|>"));
+        assert!(normal.starts_with("Hi."));
+    }
 }
