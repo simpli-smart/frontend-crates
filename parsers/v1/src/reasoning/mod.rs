@@ -60,6 +60,10 @@ fn get_reasoning_parser_map() -> &'static HashMap<&'static str, ReasoningParserT
         map.insert("deepseek_v4", ReasoningParserType::DeepSeekV4);
         map.insert("deepseek-v4", ReasoningParserType::DeepSeekV4);
         map.insert("deepseekv4", ReasoningParserType::DeepSeekV4);
+        // DeepSeek-V4.1 keeps V4's `<think>` / `</think>` delimiters (checkpoint encoding.py).
+        map.insert("deepseek_v41", ReasoningParserType::DeepSeekV4);
+        map.insert("deepseek-v41", ReasoningParserType::DeepSeekV4);
+        map.insert("deepseekv41", ReasoningParserType::DeepSeekV4);
         map.insert("nemotron_deci", ReasoningParserType::NemotronDeci);
         map.insert("kimi", ReasoningParserType::Kimi);
         map.insert("kimi_k25", ReasoningParserType::KimiK25);

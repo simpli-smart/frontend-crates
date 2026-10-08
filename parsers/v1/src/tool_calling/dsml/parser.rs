@@ -372,7 +372,8 @@ fn parse_parameters(
     for param_match in param_regex.captures_iter(content) {
         if let (Some(name_match), Some(value_match)) = (param_match.get(1), param_match.get(3)) {
             let param_name = name_match.as_str().trim();
-            let param_value = value_match.as_str().trim();
+            let raw_value = value_match.as_str();
+            let param_value = raw_value.trim();
 
             // Parse value based on string attribute (if present).
             // `string="true"` forces the String branch; every other case
@@ -380,7 +381,11 @@ fn parse_parameters(
             // falls back to String.
             let string_attr = param_match.get(2).map(|m| m.as_str());
             let value = if string_attr == Some("true") {
-                serde_json::Value::String(param_value.to_string())
+                serde_json::Value::String(if config.trim_string_values {
+                    param_value.to_string()
+                } else {
+                    raw_value.to_string()
+                })
             } else {
                 serde_json::from_str(param_value)
                     .unwrap_or_else(|_| serde_json::Value::String(param_value.to_string()))
