@@ -3323,6 +3323,71 @@ mod tests {
             .collect()
     }
 
+    // ---- DeepSeek-V4.1 streaming (b300-cost patch) ----
+    fn v41s(s: &str) -> String {
+        s.replace("|D|", "\u{ff5c}DSML\u{ff5c}")
+    }
+
+    async fn run_v41_stream(text: &str, chunk_chars: usize) -> (Vec<(String, serde_json::Value)>, String) {
+        let chars: Vec<char> = text.chars().collect();
+        let chunks: Vec<_> = chars
+            .chunks(chunk_chars)
+            .map(|c| text_chunk(&c.iter().collect::<String>()))
+            .collect();
+        let jail = JailedStream::builder().tool_call_parser("deepseek_v41").build();
+        let out: Vec<_> = jail
+            .apply_with_finish_reason(Box::pin(stream::iter(chunks)))
+            .collect()
+            .await;
+        let calls = collect_tool_calls(&out)
+            .into_iter()
+            .map(|(n, a)| (n, serde_json::from_str(&a).unwrap_or(serde_json::Value::Null)))
+            .collect();
+        (calls, collect_text_content(&out))
+    }
+
+    #[tokio::test]
+    async fn test_deepseek_v41_stream_tool_only_turn() {
+        let text = v41s(concat!(
+            "\n\n<|D| calls>\n<|D| invoke name=\"bash\">\n",
+            "<|D| parameter name=\"command\" string=\"true\">pytest -x -q</|D| parameter>\n",
+            "<|D| parameter name=\"timeout\" string=\"false\">120</|D| parameter>\n",
+            "</|D| invoke>\n</|D| calls>"
+        ));
+        for n in [1, 3, 7, 1000] {
+            let (calls, content) = run_v41_stream(&text, n).await;
+            assert_eq!(calls.len(), 1, "chunk {n}: {calls:?}");
+            assert_eq!(calls[0].0, "bash");
+            assert_eq!(calls[0].1, serde_json::json!({"command": "pytest -x -q", "timeout": 120}));
+            assert_eq!(content, "", "chunk {n}: content must be empty, got {content:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deepseek_v41_stream_text_then_tool() {
+        let text = v41s(concat!(
+            "Running the tests.\n\n<|D| calls>\n<|D| invoke name=\"bash\">\n",
+            "<|D| parameter name=\"command\" string=\"true\">\nmake -j8\n</|D| parameter>\n",
+            "</|D| invoke>\n</|D| calls>"
+        ));
+        for n in [1, 4, 1000] {
+            let (calls, content) = run_v41_stream(&text, n).await;
+            assert_eq!(calls.len(), 1, "chunk {n}");
+            assert_eq!(calls[0].1["command"], "\nmake -j8\n", "chunk {n}: verbatim string value");
+            assert_eq!(content, "Running the tests.", "chunk {n}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deepseek_v41_stream_plain_text_blank_lines_released() {
+        let text = "First paragraph.\n\nSecond one.\n\nThird.";
+        for n in [1, 2, 5, 1000] {
+            let (calls, content) = run_v41_stream(text, n).await;
+            assert!(calls.is_empty());
+            assert_eq!(content, text, "chunk {n}: held \\n\\n must be released unchanged");
+        }
+    }
+
     #[tokio::test]
     async fn test_tool_call_preserves_logprobs_single_chunk() {
         let jail = JailedStream::builder().tool_call_parser("hermes").build();
