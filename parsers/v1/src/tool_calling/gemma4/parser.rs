@@ -17,6 +17,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
+use super::format::clean_visible_prefix;
 use super::super::ToolDefinition;
 use super::super::response::{CalledFunction, ToolCallResponse, ToolCallType};
 
@@ -432,8 +433,8 @@ pub fn try_tool_call_parse_gemma4(
             );
             String::new()
         } else {
-            // No markup at all → plain text passes through unchanged. No strip.
-            message.trim().to_string()
+            // No markup at all → plain text with empty-thinking suppression.
+            clean_visible_prefix(message.trim())
         }
     } else {
         // Success: prefix-only contract — drop everything from the first
@@ -452,13 +453,32 @@ pub fn try_tool_call_parse_gemma4(
                     "gemma4 strip (success): kept prefix before first <|tool_call>; dropped parsed-call(s) + any inter-call / trailing narration. preview={:?}",
                     preview
                 );
-                message[..idx].trim().to_string()
+                // strip_leaked_empty_thinking via clean_visible_prefix (vLLM PR #5 parity).
+                clean_visible_prefix(message[..idx].trim())
             }
             None => String::new(),
         }
     };
 
     Ok((calls, Some(normal_text)))
+}
+
+/// Parse Gemma4 args in streaming mode, withholding incomplete tail values.
+pub fn parse_args_object_partial(input: &str) -> Value {
+    parse_args_object_with_opts(input, true).unwrap_or_else(|_| Value::Object(Map::new()))
+}
+
+/// Trim trailing JSON/structural chars unsafe to stream before the end marker.
+pub fn trim_safe_json_suffix(json: &str) -> String {
+    let mut safe = json.to_string();
+    while let Some(ch) = safe.chars().last() {
+        if matches!(ch, '}' | '"' | ']' | '<' | '|' | '\\' | '>') {
+            safe.pop();
+        } else {
+            break;
+        }
+    }
+    safe
 }
 
 // ---------------------------------------------------------------------------
@@ -484,11 +504,24 @@ pub fn try_tool_call_parse_gemma4(
 struct Cursor<'a> {
     src: &'a str,
     pos: usize,
+    partial: bool,
 }
 
 impl<'a> Cursor<'a> {
     fn new(src: &'a str) -> Self {
-        Self { src, pos: 0 }
+        Self {
+            src,
+            pos: 0,
+            partial: false,
+        }
+    }
+
+    fn with_partial(src: &'a str, partial: bool) -> Self {
+        Self {
+            src,
+            pos: 0,
+            partial,
+        }
     }
 
     fn rest(&self) -> &'a str {
@@ -521,11 +554,15 @@ impl<'a> Cursor<'a> {
 }
 
 pub(crate) fn parse_args_object(input: &str) -> anyhow::Result<Value> {
-    let mut cur = Cursor::new(input);
+    parse_args_object_with_opts(input, false)
+}
+
+fn parse_args_object_with_opts(input: &str, partial: bool) -> anyhow::Result<Value> {
+    let mut cur = Cursor::with_partial(input, partial);
     cur.skip_whitespace();
     let val = parse_object_body(&mut cur)?;
     cur.skip_whitespace();
-    if !cur.eof() {
+    if !partial && !cur.eof() {
         anyhow::bail!(
             "trailing characters after Gemma 4 args object at offset {}: {:?}",
             cur.pos,
@@ -543,16 +580,37 @@ fn parse_object_body(cur: &mut Cursor) -> anyhow::Result<Value> {
     }
     loop {
         cur.skip_whitespace();
-        let key = parse_key(cur)?;
+        let key = match parse_key(cur) {
+            Ok(k) => k,
+            Err(_) if cur.partial => break,
+            Err(e) => return Err(e),
+        };
         cur.skip_whitespace();
         if !cur.consume_byte(b':') {
+            if cur.partial {
+                break;
+            }
             anyhow::bail!("expected ':' after key '{}' at offset {}", key, cur.pos);
         }
         cur.skip_whitespace();
-        // `key:` with no value emits `{"key": ""}` (matches upstream).
-        let value = match cur.peek_byte() {
-            None | Some(b',') | Some(b'}') => Value::String(String::new()),
-            _ => parse_value(cur)?,
+        if cur.eof() {
+            if cur.partial {
+                break;
+            }
+            map.insert(key, Value::String(String::new()));
+            break;
+        }
+        let peek = cur.peek_byte();
+        if cur.partial && matches!(peek, Some(b',') | Some(b'}')) {
+            break;
+        }
+        let value = match peek {
+            None | Some(b',') | Some(b'}') if !cur.partial => Value::String(String::new()),
+            _ => match parse_value(cur) {
+                Ok(v) => v,
+                Err(_) if cur.partial => break,
+                Err(e) => return Err(e),
+            },
         };
         map.insert(key, value);
         cur.skip_whitespace();
@@ -629,6 +687,9 @@ fn parse_value(cur: &mut Cursor) -> anyhow::Result<Value> {
         let v = parse_object_body(cur)?;
         cur.skip_whitespace();
         if !cur.consume_byte(b'}') {
+            if cur.partial {
+                return Ok(v);
+            }
             anyhow::bail!("expected '}}' to close object at offset {}", cur.pos);
         }
         return Ok(v);
@@ -665,15 +726,29 @@ fn parse_array(cur: &mut Cursor) -> anyhow::Result<Value> {
     }
     loop {
         cur.skip_whitespace();
-        items.push(parse_value(cur)?);
+        if cur.eof() && cur.partial {
+            break;
+        }
+        items.push(match parse_value(cur) {
+            Ok(v) => v,
+            Err(_) if cur.partial => break,
+            Err(e) => return Err(e),
+        });
         cur.skip_whitespace();
         if cur.consume_byte(b']') {
             return Ok(Value::Array(items));
         }
+        if cur.partial && cur.eof() {
+            break;
+        }
         if !cur.consume_byte(b',') {
+            if cur.partial {
+                break;
+            }
             anyhow::bail!("expected ',' or ']' in array at offset {}", cur.pos);
         }
     }
+    Ok(Value::Array(items))
 }
 
 fn parse_number(cur: &mut Cursor) -> anyhow::Result<Value> {
@@ -687,6 +762,9 @@ fn parse_number(cur: &mut Cursor) -> anyhow::Result<Value> {
         cur.pos += 1;
     }
     if cur.pos == int_start {
+        if cur.partial && cur.eof() {
+            anyhow::bail!("withhold incomplete bare value");
+        }
         anyhow::bail!(
             "expected value at offset {} but got: {:?}",
             start,
@@ -702,6 +780,9 @@ fn parse_number(cur: &mut Cursor) -> anyhow::Result<Value> {
         }
     }
     let lex = &cur.src[start..cur.pos];
+    if cur.partial && cur.eof() && lex.ends_with('.') {
+        anyhow::bail!("withhold trailing decimal point");
+    }
     if is_float {
         let f: f64 = lex.parse()?;
         Ok(serde_json::json!(f))
@@ -720,6 +801,19 @@ mod tests {
         assert_eq!(calls.len(), 1, "expected exactly one tool call");
         let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         (calls[0].function.name.clone(), args)
+    }
+
+    #[test]
+    fn partial_args_withhold_trailing_decimal() {
+        let partial = parse_args_object_partial("count:108.");
+        assert_eq!(partial, Value::Object(Map::new()));
+        let complete = parse_args_object("count:108.2").unwrap();
+        assert_eq!(complete["count"], 108.2);
+    }
+
+    #[test]
+    fn trim_safe_json_suffix_strips_unsafe_tail() {
+        assert_eq!(trim_safe_json_suffix(r#"{"a":1}"#), r#"{"a":1"#);
     }
 
     #[test] // detection helper
@@ -1066,9 +1160,9 @@ mod tests {
         assert_eq!(calls[0].function.name, "get_weather");
         let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["location"], "Tokyo");
-        // The reasoning span is preserved as normal_text — the tool-call parser
-        // doesn't try to interpret `<|channel>` markers itself.
-        assert!(normal.unwrap().contains("<|channel>thought"));
+        // With reasoning parsing disabled, empty-thinking cleanup strips channel
+        // markers but preserves the reasoning body before the tool call.
+        assert!(normal.unwrap().contains("thinking about the request"));
     }
 
     // DEPRECATED(parser-fixture-duplicate): Duplicate of YAML fixture coverage: TOOLCALLING.batch.9 in tests/parity/toolcalling/fixtures/gemma4/TOOLCALLING.batch.yaml.
