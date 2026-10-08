@@ -43,7 +43,11 @@ pub use config::{
     ToolCallConfig, XmlParserConfig,
 };
 pub use dsml::try_tool_call_parse_dsml;
-pub use gemma4::try_tool_call_parse_gemma4;
+pub use gemma4::{
+    diff_reasoning_streaming_snapshots, extract_reasoning_non_streaming,
+    extract_tool_handoff_text, strip_trailing_incomplete_token, try_tool_call_parse_gemma4,
+    ReasoningSnapshot, StreamingContentCleaner,
+};
 pub use harmony::parse_tool_calls_harmony_complete;
 pub use json::try_tool_call_parse_json;
 pub use parsers::{
