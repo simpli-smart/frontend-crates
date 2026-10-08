@@ -318,14 +318,17 @@ mod tests {
     }
 
     #[test]
-    fn detect_multiple_reasoning_spans_first_only() {
+    fn detect_multiple_reasoning_spans_concatenated() {
         let mut p = Gemma4ReasoningParser::new();
         let input =
             "<|channel>thought\nfirst<channel|> middle <|channel>thought\nsecond<channel|> done";
         let r = p.detect_and_parse_reasoning(input, &[]);
-        assert_eq!(r.reasoning_text, "first");
+        // Every closed span is reasoning, joined in order; only the text between
+        // and after them is content. Matches upstream and the conformance suite.
+        assert_eq!(r.reasoning_text, "firstsecond");
         assert!(r.normal_text.contains("middle"));
-        assert!(r.normal_text.contains("second"));
+        assert!(r.normal_text.contains("done"));
+        assert!(!r.normal_text.contains("second"));
     }
 
     #[test]

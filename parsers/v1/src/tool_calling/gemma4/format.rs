@@ -486,7 +486,40 @@ pub fn extract_reasoning_non_streaming(model_output: &str) -> ReasoningSnapshot 
         };
     };
 
-    let reasoning_text = reason_part.trim();
+    // Walk any further `<|channel>…<channel|>` spans and concatenate their bodies,
+    // matching upstream: reasoning is every span joined, content is what is left.
+    let mut reasoning_acc = reason_part.trim().to_string();
+    let mut tail = String::new();
+    let mut rest_spans = content_part;
+    loop {
+        let Some((before_span, after_start)) = rest_spans.split_once(CHANNEL_START) else {
+            tail.push_str(rest_spans);
+            break;
+        };
+        let mut body = after_start;
+        if let Some(stripped) = body.strip_prefix(THOUGHT_PREFIX) {
+            body = stripped;
+        }
+        tail.push_str(before_span);
+        match body.split_once(CHANNEL_END) {
+            Some((span, after_end)) => {
+                reasoning_acc.push_str(span.trim());
+                rest_spans = after_end;
+            }
+            None => {
+                // Trailing span never closes. Leave it in content untouched so the
+                // leaked-marker cleanup downstream decides, which is what the
+                // streaming path relies on; only CLOSED spans are concatenated.
+                tail.push_str(CHANNEL_START);
+                tail.push_str(after_start);
+                rest_spans = "";
+                break;
+            }
+        }
+    }
+    let content_part: &str = &tail;
+
+    let reasoning_text = reasoning_acc.as_str();
     let merged_content = format!("{before_channel}{content_part}");
     let content = if content_part.is_empty() {
         // Channel closed but no post-marker text yet — hold content until more arrives.
