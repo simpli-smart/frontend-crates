@@ -60,6 +60,9 @@ pub fn get_tool_parser_map() -> &'static HashMap<&'static str, ToolCallConfig> {
         map.insert("deepseek_v4", ToolCallConfig::deepseek_v4());
         map.insert("deepseek-v4", ToolCallConfig::deepseek_v4());
         map.insert("deepseekv4", ToolCallConfig::deepseek_v4());
+        map.insert("deepseek_v41", ToolCallConfig::deepseek_v41());
+        map.insert("deepseek-v41", ToolCallConfig::deepseek_v41());
+        map.insert("deepseekv41", ToolCallConfig::deepseek_v41());
         map.insert("qwen3_coder", ToolCallConfig::qwen3_coder());
         map.insert("jamba", ToolCallConfig::jamba());
         map.insert("minimax_m2", ToolCallConfig::minimax_m2());
@@ -478,6 +481,9 @@ mod tests {
             "deepseek_v4",
             "deepseek-v4",
             "deepseekv4",
+            "deepseek_v41",
+            "deepseek-v41",
+            "deepseekv41",
             "qwen3_coder",
             "jamba",
             "nemotron_nano",
@@ -1964,6 +1970,105 @@ Remember, San Francisco weather can be quite unpredictable, particularly with it
         let (name, args) = extract_name_and_args(result[1].clone());
         assert_eq!(name, "get_current_weather");
         assert_eq!(args["location"], "Paris");
+    }
+
+    // ---- DeepSeek-V4.1 (b300-cost patch): spaced DSML tags, verbatim string values ----
+    fn v41(s: &str) -> String {
+        s.replace("|D|", "\u{ff5c}DSML\u{ff5c}")
+    }
+
+    #[tokio::test]
+    async fn test_deepseek_v41_single_call_typed_params_with_text() {
+        let input = v41(concat!(
+            "I'll check the file.\n\n",
+            "<|D| calls>\n",
+            "<|D| invoke name=\"read_file\">\n",
+            "<|D| parameter name=\"path\" string=\"true\">/r/a b.py</|D| parameter>\n",
+            "<|D| parameter name=\"limit\" string=\"false\">200</|D| parameter>\n",
+            "<|D| parameter name=\"opts\" string=\"false\">{\"x\": [1, true, null]}</|D| parameter>\n",
+            "</|D| invoke>\n",
+            "</|D| calls>"
+        ));
+        let (calls, normal) = detect_and_parse_tool_call(&input, Some("deepseek_v41"), None)
+            .await
+            .expect("parse");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, serde_json::json!({"path": "/r/a b.py", "limit": 200, "opts": {"x": [1, true, null]}}));
+        println!("V41 normal_text = {:?}", normal);
+        assert_eq!(normal, Some("I'll check the file.".to_string()), "reference content excludes the \\n\\n before the block");
+    }
+
+    #[tokio::test]
+    async fn test_deepseek_v41_multiple_calls() {
+        // no content: the model still emits "\n\n" before the block (encoder always does)
+        let input = v41(concat!(
+            "\n\n<|D| calls>\n",
+            "<|D| invoke name=\"bash\">\n",
+            "<|D| parameter name=\"command\" string=\"true\">pytest -x -q</|D| parameter>\n",
+            "</|D| invoke>\n",
+            "<|D| invoke name=\"read_file\">\n",
+            "<|D| parameter name=\"path\" string=\"true\">/r/tests/test_a.py</|D| parameter>\n",
+            "</|D| invoke>\n",
+            "</|D| calls>"
+        ));
+        let (calls, _) = detect_and_parse_tool_call(&input, Some("deepseek_v41"), None)
+            .await
+            .expect("parse");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[1].function.name, "read_file");
+        let a1: serde_json::Value = serde_json::from_str(&calls[1].function.arguments).unwrap();
+        assert_eq!(a1["path"], "/r/tests/test_a.py");
+    }
+
+    #[tokio::test]
+    async fn test_deepseek_v41_string_values_verbatim() {
+        let body = "\nimport os\n\n  def f():\n    return 1\n";
+        let input = v41(&format!(
+            "\n\n<|D| calls>\n<|D| invoke name=\"write\">\n<|D| parameter name=\"content\" string=\"true\">{}</|D| parameter>\n</|D| invoke>\n</|D| calls>",
+            body
+        ));
+        let (calls, _) = detect_and_parse_tool_call(&input, Some("deepseek_v41"), None)
+            .await
+            .expect("parse");
+        assert_eq!(calls.len(), 1);
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["content"], body, "V4.1 must keep string values verbatim");
+    }
+
+    #[tokio::test]
+    async fn test_deepseek_v41_tool_only_turn_after_think() {
+        // What the frontend hands the tool parser after the reasoning parser split at
+        // </think>: "\n\n<DSML calls>..." (live bug: content came back as "<DSML calls>").
+        let input = v41(concat!(
+            "\n\n<|D| calls>\n",
+            "<|D| invoke name=\"bash\">\n",
+            "<|D| parameter name=\"command\" string=\"true\">pytest -x -q</|D| parameter>\n",
+            "<|D| parameter name=\"timeout\" string=\"false\">120</|D| parameter>\n",
+            "</|D| invoke>\n",
+            "</|D| calls>"
+        ));
+        for text in [input.clone(), input.trim_start().to_string()] {
+            let (calls, normal) = detect_and_parse_tool_call(&text, Some("deepseek_v41"), None)
+                .await
+                .expect("parse");
+            assert_eq!(calls.len(), 1);
+            let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+            assert_eq!(args, serde_json::json!({"command": "pytest -x -q", "timeout": 120}));
+            assert_eq!(normal.unwrap_or_default(), "", "no DSML markup may leak into content");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deepseek_v4_still_trims_and_ignores_v41_tags() {
+        // V4 parser unchanged: V4.1 spaced tags are not a V4 tool block.
+        let input = v41("<|D| calls>\n<|D| invoke name=\"f\">\n</|D| invoke>\n</|D| calls>");
+        let (calls, _) = detect_and_parse_tool_call(&input, Some("deepseek_v4"), None)
+            .await
+            .expect("parse");
+        assert_eq!(calls.len(), 0);
     }
 
     #[tokio::test]

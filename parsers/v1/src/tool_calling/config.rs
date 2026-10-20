@@ -211,6 +211,24 @@ pub struct DsmlParserConfig {
     /// leave this `false`.
     #[serde(default)]
     pub allow_eof_recovery: bool,
+
+    /// Trim whitespace around `string="true"` parameter values (V3.2 / V4 behavior).
+    /// DeepSeek-V4.1's reference parser (encoding.py `parse_tool_calls`) keeps them
+    /// verbatim -- file contents, patches and multi-line commands start or end with
+    /// newlines -- so `deepseek_v41` sets this to `false`.
+    #[serde(default = "dsml_default_true")]
+    pub trim_string_values: bool,
+
+    /// Separator the model emits right before `block_start` that belongs to the tool-call
+    /// markup, not to the assistant content. V4.1's reference parser starts tool calls at
+    /// "\n\n<｜DSML｜ calls", so `deepseek_v41` sets "\n\n" and it is removed from the
+    /// content prefix (exact suffix only). Empty for V3.2 / V4.
+    #[serde(default)]
+    pub block_lead: String,
+}
+
+fn dsml_default_true() -> bool {
+    true
 }
 
 impl Default for DsmlParserConfig {
@@ -223,12 +241,18 @@ impl Default for DsmlParserConfig {
             parameter_prefix: "<｜DSML｜parameter name=".to_string(),
             parameter_end: "</｜DSML｜parameter>".to_string(),
             allow_eof_recovery: false,
+            trim_string_values: true,
+            block_lead: String::new(),
         }
     }
 }
 
 impl DsmlParserConfig {
-    pub(crate) fn tool_separator(&self) -> Option<&'static str> {
+    pub(crate) fn tool_separator(&self) -> Option<&str> {
+        // V4.1 names its separator explicitly; V3.2 / V4 are recognised by tag names.
+        if !self.block_lead.is_empty() {
+            return Some(self.block_lead.as_str());
+        }
         (matches!(
             self.block_start.as_str(),
             "<｜DSML｜function_calls>" | "<｜DSML｜tool_calls>"
@@ -785,9 +809,31 @@ impl ToolCallConfig {
     }
 
     fn deepseek_dsml(block_name: &str) -> Self {
+        Self::deepseek_dsml_with(block_name, "", true)
+    }
+
+    /// `sep` goes between `｜DSML｜` and every tag name: "" for V3.2 / V4, " " for V4.1
+    /// (`<｜DSML｜ calls>`, `<｜DSML｜ invoke name=`, `<｜DSML｜ parameter name=`).
+    fn deepseek_dsml_with(block_name: &str, sep: &str, trim_string_values: bool) -> Self {
+        Self::deepseek_dsml_full(block_name, sep, trim_string_values, "")
+    }
+
+    /// `lead` is prepended to the block start: V4.1's reference parser treats
+    /// "\n\n<｜DSML｜ calls" as the tool-call start, so the two newlines the model
+    /// always emits before the block are markup, not assistant content (otherwise an
+    /// agent echoing the content back gets "\n\n\n\n" in its next prompt).
+    fn deepseek_dsml_full(block_name: &str, sep: &str, trim_string_values: bool, lead: &str) -> Self {
         let dsml_config = DsmlParserConfig {
-            block_start: format!("<｜DSML｜{}>", block_name),
-            block_end: format!("</｜DSML｜{}>", block_name),
+            // The lead is NOT part of block_start: the parser trims the message first,
+            // so a leading "\n\n" would never match (seen live: tool-only turns).
+            block_start: format!("<｜DSML｜{}{}>", sep, block_name),
+            block_lead: lead.to_string(),
+            block_end: format!("</｜DSML｜{}{}>", sep, block_name),
+            invoke_start_prefix: format!("<｜DSML｜{}invoke name=", sep),
+            invoke_end: format!("</｜DSML｜{}invoke>", sep),
+            parameter_prefix: format!("<｜DSML｜{}parameter name=", sep),
+            parameter_end: format!("</｜DSML｜{}parameter>", sep),
+            trim_string_values,
             ..Default::default()
         };
         let structural_tag = StructuralTagBuilder::DsmlToolCalls(DsmlToolCallsConfig {
@@ -833,6 +879,17 @@ impl ToolCallConfig {
         // </｜DSML｜invoke>
         // </｜DSML｜tool_calls>
         Self::deepseek_dsml("tool_calls")
+    }
+
+    pub fn deepseek_v41() -> Self {
+        // DeepSeek V4.1 format (DSML, checkpoint encoding/encoding.py):
+        // <｜DSML｜ calls>
+        // <｜DSML｜ invoke name="function_name">
+        // <｜DSML｜ parameter name="param_name" string="true|false">value</｜DSML｜ parameter>
+        // </｜DSML｜ invoke>
+        // </｜DSML｜ calls>
+        // String values are kept verbatim (the reference parser does not trim).
+        Self::deepseek_dsml_full("calls", " ", false, "\n\n")
     }
 
     pub fn minimax_m2() -> Self {
