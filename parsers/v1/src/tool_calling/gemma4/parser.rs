@@ -243,6 +243,13 @@ fn is_call_name_char(ch: char) -> bool {
 }
 
 pub fn split_partial_call_prefix_gemma4(chunk: &str) -> Option<(&str, &str)> {
+    // If the text already contains a tool-call start, the jail must take the whole
+    // chunk. Splitting off a partial `c`/`ca`.. tail here would emit everything before
+    // it -- including that call start -- as content (seen with a chunk boundary right
+    // after `{`: `call:get_order_status{c` leaked `call:get_order_status{`).
+    if detect_tool_call_start_gemma4(chunk) {
+        return None;
+    }
     // A bare `call:<name>` with no `{` yet may still become a call (Gemma 4 sometimes
     // drops the `<|tool_call>` opener). Hold it so its first bytes cannot leak as
     // content before the jail sees `call:<name>{`; a following non-name char releases it.
@@ -1386,6 +1393,21 @@ mod tests {
         let (calls, normal) = try_tool_call_parse_gemma4(msg, None).unwrap();
         assert!(calls.is_empty());
         assert_eq!(normal.as_deref(), Some(msg));
+    }
+
+
+    // A partial `call:` tail must not split off a chunk that already starts a call.
+    #[test]
+    fn split_never_emits_a_started_call() {
+        for chunk in [
+            "call:get_order_status{c",
+            "call:get_order_status{ca",
+            "<|tool_call>call:f{c",
+            "Sure.<|tool_call>call:f{a:<|\"|>x<|\"|>,c",
+        ] {
+            assert_eq!(split_partial_call_prefix_gemma4(chunk), None, "{chunk:?}");
+            assert!(detect_tool_call_start_gemma4(chunk), "{chunk:?}");
+        }
     }
 
 }
