@@ -3,6 +3,8 @@
 //
 // Content-cleaning helpers ported from vLLM's gemma4_format.py (SGLang-aligned).
 
+use std::borrow::Cow;
+
 use super::parser::{CALL_PREFIX, STRING_DELIM, TOOL_CALL_END, TOOL_CALL_START};
 
 pub(crate) const CHANNEL_START: &str = "<|channel>";
@@ -538,6 +540,154 @@ pub fn extract_reasoning_non_streaming(model_output: &str) -> ReasoningSnapshot 
         reasoning: Some(reasoning_text.to_string()),
         content,
     }
+}
+
+/// Bytes at the start of an opener-less output that may hold a (possibly glitched)
+/// `thought` role label before we decide what the output is.
+const LABEL_WINDOW: usize = 32;
+/// After a bare `thought` label, bytes to wait for `<channel|>` before treating the
+/// label as an orphan. Shared by the streaming hold and the non-streaming split so both
+/// modes classify the same output identically.
+pub(crate) const ORPHAN_LABEL_HOLD: usize = 64;
+/// Max non-alphanumeric "junk" chars around the label (e.g. "```", "|", U+FFFD from a
+/// multi-byte token split across a byte-fallback boundary).
+const LABEL_MAX_JUNK: usize = 4;
+
+fn is_label_junk(c: char) -> bool {
+    !c.is_alphanumeric() && !c.is_whitespace() && c != '<'
+}
+
+fn alnum_core(text: &str) -> String {
+    text.chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+/// If `text` opens (after whitespace and a few junk chars) with the `thought` channel
+/// role label followed by a newline, return the byte offset just past the label and its
+/// trailing junk, stopping before any `<`. Matches what Gemma 4 emits on post-tool turns
+/// when it drops the `<|channel>` opener: `thought\n`, "```thought\n", `|thought\n|`,
+/// `\u{fffd}thought\n`. The label must be a whole word and be followed by `\n` or
+/// directly by `<channel|>`.
+pub(crate) fn thought_label_end(text: &str) -> Option<usize> {
+    let mut junk = 0usize;
+    let mut start = None;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if is_label_junk(c) {
+            junk += 1;
+            if junk > LABEL_MAX_JUNK {
+                return None;
+            }
+            continue;
+        }
+        start = Some(i);
+        break;
+    }
+    let start = start?;
+    let after_word = start + TH_WORD.len();
+    if !text[start..].starts_with(TH_WORD) {
+        return None;
+    }
+    if text[after_word..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let mut end = after_word;
+    let mut saw_newline = false;
+    let mut trailing_junk = 0usize;
+    for (i, c) in text[after_word..].char_indices() {
+        if c == '\n' {
+            saw_newline = true;
+        } else if c.is_whitespace() {
+        } else if is_label_junk(c) && trailing_junk < LABEL_MAX_JUNK {
+            trailing_junk += 1;
+        } else {
+            break;
+        }
+        end = after_word + i + c.len_utf8();
+    }
+    if saw_newline || text[end..].starts_with(CHANNEL_END) {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+/// Normalize Gemma 4 output whose thought channel was never opened with `<|channel>`
+/// (no opener before the first `<channel|>`, or no channel markers at all), so the
+/// shared snapshot extraction never sees role labels or dangling markers as content.
+/// Mirrors vLLM's gemma4 parser (bare-`thought` opener injection, `<channel|>`
+/// absorption in content, `thought\n` label stripping) and generalizes it to the
+/// glitched shapes captured from the Exotel leakage suite:
+///
+/// - `[junk]thought\n[junk]<channel|>answer` or `<channel|>answer` -> empty reasoning,
+///   content `answer`.
+/// - `[junk]thought\n<reasoning><channel|>answer`, reasoning within
+///   [`ORPHAN_LABEL_HOLD`] bytes -> reasoning + content.
+/// - any other `<channel|>` with no opener -> the stray marker is dropped (and a
+///   leading orphan label with it).
+/// - `[junk]thought\n<text>` with no `<channel|>` -> orphan label stripped.
+/// - `<tool_call|>` / `<|"|>` with no tool-call start anywhere -> dropped.
+///
+/// Output that opens its channel properly is returned unchanged.
+pub(crate) fn normalize_opener_less(text: &str) -> Cow<'_, str> {
+    let opener_less = match (text.find(CHANNEL_START), text.find(CHANNEL_END)) {
+        (Some(s), Some(e)) => e < s,
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
+    if !opener_less {
+        return Cow::Borrowed(text);
+    }
+
+    let mut s: Cow<'_, str> = Cow::Borrowed(text);
+    let has_call_start = s.contains(TOOL_CALL_START) || tool_call_markup_start(&s).is_some();
+    if !has_call_start && (s.contains(TOOL_CALL_END) || s.contains(STRING_DELIM)) {
+        s = Cow::Owned(s.replace(TOOL_CALL_END, "").replace(STRING_DELIM, ""));
+    }
+
+    if let Some(idx) = s.find(CHANNEL_END) {
+        let prefix = &s[..idx];
+        let after = &s[idx + CHANNEL_END.len()..];
+        if prefix.len() <= LABEL_WINDOW && matches!(alnum_core(prefix).as_str(), "" | TH_WORD) {
+            return Cow::Owned(format!("{CHANNEL_START}{THOUGHT_PREFIX}{CHANNEL_END}{after}"));
+        }
+        let label = thought_label_end(prefix);
+        if let Some(e) = label
+            && idx - e <= ORPHAN_LABEL_HOLD
+        {
+            let reasoning = &prefix[e..];
+            return Cow::Owned(format!(
+                "{CHANNEL_START}{THOUGHT_PREFIX}{reasoning}{CHANNEL_END}{after}"
+            ));
+        }
+        let body = label.map_or(&s[..], |e| &s[e..]);
+        return Cow::Owned(body.replace(CHANNEL_END, ""));
+    }
+
+    if let Some(e) = thought_label_end(&s) {
+        return Cow::Owned(s[e..].to_string());
+    }
+    s
+}
+
+/// Streaming: true while an opener-less output could still resolve into a role label
+/// or an empty thought block, so nothing must be emitted yet. Covers whitespace/junk
+/// only, a partial `thought` word, and a complete label still waiting (up to
+/// [`ORPHAN_LABEL_HOLD`] bytes) for its `<channel|>`. `text` should already have any
+/// trailing incomplete marker stripped.
+pub(crate) fn opener_less_undecided(text: &str) -> bool {
+    if text.contains(CHANNEL_START) || text.contains(CHANNEL_END) {
+        return false;
+    }
+    if text.len() <= LABEL_WINDOW && TH_WORD.starts_with(alnum_core(text).as_str()) {
+        return true;
+    }
+    thought_label_end(text).is_some_and(|e| text.len() - e <= ORPHAN_LABEL_HOLD)
 }
 
 /// Client-visible content pipeline: empty-thinking suppression + tool-suffix strip.

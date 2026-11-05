@@ -15,13 +15,12 @@
 //! Parsing semantics align with vLLM/SGLang ``Gemma4Detector`` (snapshot-based
 //! streaming on incomplete-marker-safe prefixes).
 
-use std::borrow::Cow;
-
 use crate::ParserResult;
 use crate::ReasoningParser;
 use crate::tool_calling::gemma4::{
-    diff_reasoning_streaming_snapshots, extract_reasoning_non_streaming,
-    strip_trailing_incomplete_token, ReasoningSnapshot, CHANNEL_END, CHANNEL_START,
+    diff_reasoning_streaming_snapshots, extract_reasoning_non_streaming, normalize_opener_less,
+    opener_less_undecided, strip_trailing_incomplete_token, ReasoningSnapshot, CHANNEL_END,
+    CHANNEL_START,
 };
 
 #[derive(Debug, Clone)]
@@ -34,29 +33,9 @@ pub struct Gemma4ReasoningParser {
     last_safe_text: String,
     /// Client-visible content already emitted (avoids duplicate pre-channel text).
     emitted_content: String,
-}
-
-/// Channel role label the model writes right after `<|channel>`.
-const THOUGHT_PREFIX: &str = "thought\n";
-
-/// Gemma 4 sometimes opens its (often empty) thought block without the `<|channel>`
-/// token, e.g. on post-tool turns: `thought\n<channel|>Great news...`. vLLM injects the
-/// missing opener for a bare `thought` prefix (simpli-smart/vllm 7fcf96161f); do the same so
-/// the label and the dangling `<channel|>` never reach `content`.
-fn normalize_bare_thought_prefix(text: &str) -> Cow<'_, str> {
-    let body = text.trim_start();
-    if body.starts_with(THOUGHT_PREFIX) {
-        let ws = &text[..text.len() - body.len()];
-        return Cow::Owned(format!("{ws}{CHANNEL_START}{body}"));
-    }
-    Cow::Borrowed(text)
-}
-
-/// True while the stream could still turn into a bare `thought\n` prefix
-/// (whitespace only, or a strict prefix of `thought\n` after whitespace).
-fn bare_thought_prefix_undecided(text: &str) -> bool {
-    let body = text.trim_start();
-    body.is_empty() || (body.len() < THOUGHT_PREFIX.len() && THOUGHT_PREFIX.starts_with(body))
+    /// Whether the start of the stream has been classified (opener-less label / empty
+    /// thought block vs. ordinary output). Output is held until it is.
+    start_decided: bool,
 }
 
 impl Gemma4ReasoningParser {
@@ -66,6 +45,7 @@ impl Gemma4ReasoningParser {
             prev_cumulative_text: String::new(),
             last_safe_text: String::new(),
             emitted_content: String::new(),
+            start_decided: false,
         }
     }
 
@@ -97,7 +77,7 @@ impl Default for Gemma4ReasoningParser {
 
 impl ReasoningParser for Gemma4ReasoningParser {
     fn detect_and_parse_reasoning(&mut self, text: &str, _token_ids: &[u32]) -> ParserResult {
-        let text = normalize_bare_thought_prefix(text);
+        let text = normalize_opener_less(text);
         Self::snapshot_to_parser_result(&extract_reasoning_non_streaming(&text))
     }
 
@@ -108,12 +88,16 @@ impl ReasoningParser for Gemma4ReasoningParser {
     ) -> ParserResult {
         self.prev_cumulative_text = self.cumulative_text.clone();
         self.cumulative_text.push_str(text);
-        // Hold output until we know whether it opens with a bare `thought\n` label.
-        if bare_thought_prefix_undecided(&self.cumulative_text) {
-            return ParserResult::default();
+        // Hold output until we know whether it opens with an opener-less role label or
+        // empty thought block (see `normalize_opener_less`); decided once per stream.
+        if !self.start_decided {
+            if opener_less_undecided(&strip_trailing_incomplete_token(&self.cumulative_text)) {
+                return ParserResult::default();
+            }
+            self.start_decided = true;
         }
-        let norm_curr = normalize_bare_thought_prefix(&self.cumulative_text).into_owned();
-        let norm_prev = normalize_bare_thought_prefix(&self.prev_cumulative_text).into_owned();
+        let norm_curr = normalize_opener_less(&self.cumulative_text).into_owned();
+        let norm_prev = normalize_opener_less(&self.prev_cumulative_text).into_owned();
         let safe_curr = strip_trailing_incomplete_token(&norm_curr);
 
         if safe_curr == self.last_safe_text {
@@ -162,19 +146,38 @@ impl ReasoningParser for Gemma4ReasoningParser {
         }
     }
 
+    /// Flush what the stream has not emitted yet (the trait contract: only the
+    /// remainder, like every other parser). Covers output still held as a possible
+    /// role label and the tail kept back as an incomplete marker.
     fn finish_reasoning_stream(&mut self) -> ParserResult {
         if self.cumulative_text.is_empty() {
             return ParserResult::default();
         }
 
         let full = std::mem::take(&mut self.cumulative_text);
+        let last_safe = std::mem::take(&mut self.last_safe_text);
+        let emitted = std::mem::take(&mut self.emitted_content);
         self.prev_cumulative_text.clear();
-        self.last_safe_text.clear();
-        self.emitted_content.clear();
+        self.start_decided = false;
 
-        let full = normalize_bare_thought_prefix(&full);
-        let final_snapshot = extract_reasoning_non_streaming(&full);
-        Self::snapshot_to_parser_result(&final_snapshot)
+        let final_snapshot = extract_reasoning_non_streaming(&normalize_opener_less(&full));
+        let prev_snapshot = if last_safe.is_empty() {
+            ReasoningSnapshot::default()
+        } else {
+            Self::snapshot_from_safe_text(&last_safe)
+        };
+        let (reasoning_text, mut normal_text) =
+            diff_reasoning_streaming_snapshots(&final_snapshot, &prev_snapshot);
+        if let Some(ref content) = final_snapshot.content
+            && !emitted.is_empty()
+            && content.starts_with(&emitted)
+        {
+            normal_text = content[emitted.len()..].to_string();
+        }
+        ParserResult {
+            normal_text,
+            reasoning_text,
+        }
     }
 }
 
@@ -220,12 +223,15 @@ mod tests {
         assert_eq!(r.normal_text, "Hello.  Goodbye.");
     }
 
+    // A `<channel|>` with no opener is never client-visible (vLLM absorbs it in
+    // CONTENT state); the surrounding text is kept as content because it is not a role
+    // label, so it cannot be told apart from a real answer.
     #[test]
-    fn detect_dangling_end_marker_passes_through_as_content() {
+    fn detect_dangling_end_marker_is_absorbed() {
         let mut p = Gemma4ReasoningParser::new();
         let r = p.detect_and_parse_reasoning("some thinking<channel|>final answer", &[]);
         assert_eq!(r.reasoning_text, "");
-        assert_eq!(r.normal_text, "some thinking<channel|>final answer");
+        assert_eq!(r.normal_text, "some thinkingfinal answer");
     }
 
     // Bare `thought\n` with no `<|channel>` opener is an implicitly opened channel
@@ -469,4 +475,201 @@ mod tests {
         assert!(!normal.contains("<channel|>"));
         assert!(normal.starts_with("Hi."));
     }
+
+    /// Every leaked `content` shape captured from the Exotel leakage suite on
+    /// Gemma-4-26B-A4B-NVFP4 (post-tool turns), as raw model text, with the content a
+    /// client must receive. Run through detect (non-streaming), token-like streaming,
+    /// and byte-by-byte streaming; all three must agree.
+    const CAPTURED: &[(&str, &str)] = &[
+        ("thought\n<channel|>Great news, Rajesh!", "Great news, Rajesh!"),
+        ("\nthought\n<channel|>Great news, Amit!", "Great news, Amit!"),
+        ("<channel|>मुझे बहुत खेद है", "मुझे बहुत खेद है"),
+        ("```thought\n<channel|>मुझे बहुत दुख है", "मुझे बहुत दुख है"),
+        ("\u{fffd}thought\n<channel|>أنا أتفهم تماماً", "أنا أتفهم تماماً"),
+        ("|thought\n|<channel|>أعتذر جداً على التأخير!", "أعتذر جداً على التأخير!"),
+        ("<|\"|>thought\n<channel|>मुझे बहुत दुख है", "मुझे बहुत दुख है"),
+        ("<|\"|>أعتذر جداً على التأخير!", "أعتذر جداً على التأخير!"),
+        (".\"\"\"}<tool_call|>", ".\"\"\"}"),
+        ("thought\nI'm really sorry that your shipment hasn't reached you yet.",
+         "I'm really sorry that your shipment hasn't reached you yet."),
+    ];
+
+    fn stream_all(chunks: &[&str]) -> (String, String) {
+        let mut p = Gemma4ReasoningParser::new();
+        let (mut normal, mut reasoning) = (String::new(), String::new());
+        for c in chunks {
+            let r = p.parse_reasoning_streaming_incremental(c, &[]);
+            normal.push_str(&r.normal_text);
+            reasoning.push_str(&r.reasoning_text);
+        }
+        if normal.is_empty() && reasoning.is_empty() {
+            let r = p.finish_reasoning_stream();
+            normal.push_str(&r.normal_text);
+            reasoning.push_str(&r.reasoning_text);
+        }
+        (normal, reasoning)
+    }
+
+    /// Split like a tokenizer would: special markers stay whole, text in small pieces.
+    fn token_like_chunks(raw: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = raw;
+        let markers = ["<|channel>", "<channel|>", "<tool_call|>", "<|tool_call>", "<|\"|>"];
+        while !rest.is_empty() {
+            if let Some(m) = markers.iter().find(|m| rest.starts_with(**m)) {
+                out.push(m.to_string());
+                rest = &rest[m.len()..];
+                continue;
+            }
+            let mut end = 0;
+            for (i, c) in rest.char_indices() {
+                if i > 0 && (markers.iter().any(|m| rest[i..].starts_with(m)) || i >= 3) {
+                    break;
+                }
+                end = i + c.len_utf8();
+            }
+            out.push(rest[..end].to_string());
+            rest = &rest[end..];
+        }
+        out
+    }
+
+    #[test]
+    fn captured_leak_shapes_non_streaming() {
+        for (raw, want) in CAPTURED {
+            let mut p = Gemma4ReasoningParser::new();
+            let r = p.detect_and_parse_reasoning(raw, &[]);
+            assert_eq!(r.normal_text.trim(), *want, "raw={raw:?}");
+            assert!(r.reasoning_text.trim().is_empty(), "raw={raw:?} reasoning={:?}", r.reasoning_text);
+        }
+    }
+
+    #[test]
+    fn captured_leak_shapes_streaming_token_like() {
+        for (raw, want) in CAPTURED {
+            let chunks = token_like_chunks(raw);
+            let refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
+            let (normal, reasoning) = stream_all(&refs);
+            assert_eq!(normal.trim(), *want, "raw={raw:?} chunks={chunks:?}");
+            assert!(reasoning.trim().is_empty(), "raw={raw:?} reasoning={reasoning:?}");
+        }
+    }
+
+    #[test]
+    fn captured_leak_shapes_streaming_char_by_char() {
+        for (raw, want) in CAPTURED {
+            let chars: Vec<String> = raw.chars().map(|c| c.to_string()).collect();
+            let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
+            let (normal, _) = stream_all(&refs);
+            assert_eq!(normal.trim(), *want, "raw={raw:?}");
+        }
+    }
+
+    // Label followed by short opener-less reasoning that is then closed: reasoning, in
+    // both modes (the shared ORPHAN_LABEL_HOLD window keeps them consistent).
+    #[test]
+    fn opener_less_label_with_short_reasoning_is_reasoning() {
+        let raw = "thought\nUser wants order status.<channel|>Your order is on its way.";
+        let mut p = Gemma4ReasoningParser::new();
+        let r = p.detect_and_parse_reasoning(raw, &[]);
+        assert_eq!(r.reasoning_text, "User wants order status.");
+        assert_eq!(r.normal_text, "Your order is on its way.");
+        let chunks = token_like_chunks(raw);
+        let refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
+        let (normal, reasoning) = stream_all(&refs);
+        assert_eq!(normal.trim(), "Your order is on its way.");
+        assert_eq!(reasoning.trim(), "User wants order status.");
+    }
+
+    // Ordinary answers are never held back or altered.
+    #[test]
+    fn ordinary_answers_untouched() {
+        for raw in [
+            "The answer is 42.",
+            "Thought experiment: imagine a train.",
+            "thoughtful reply here",
+            "I thought about it.\nThe answer is 42.",
+            "मुझे बहुत खेद है",
+            "4",
+        ] {
+            let mut p = Gemma4ReasoningParser::new();
+            assert_eq!(p.detect_and_parse_reasoning(raw, &[]).normal_text, raw);
+            let chunks = token_like_chunks(raw);
+            let refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
+            assert_eq!(stream_all(&refs).0, raw, "raw={raw:?}");
+        }
+    }
+
+    // A first chunk that is clearly not a label is emitted immediately (no hold).
+    #[test]
+    fn non_label_start_is_not_held() {
+        let mut p = Gemma4ReasoningParser::new();
+        assert_eq!(p.parse_reasoning_streaming_incremental("Hello", &[]).normal_text, "Hello");
+    }
+
+    // Tool-call markup must survive the reasoning parser for the tool parser downstream.
+    #[test]
+    fn tool_markup_preserved_for_tool_parser() {
+        for raw in [
+            "<|tool_call>call:get_order_status{awb:<|\"|>123<|\"|>}<tool_call|>",
+            "call:get_order_status{awb:<|\"|>123<|\"|>}",
+            "thought\n<channel|><|tool_call>call:f{a:<|\"|>x<|\"|>}<tool_call|>",
+        ] {
+            let mut p = Gemma4ReasoningParser::new();
+            let r = p.detect_and_parse_reasoning(raw, &[]);
+            assert!(r.normal_text.contains("call:"), "raw={raw:?} -> {:?}", r.normal_text);
+            assert!(r.normal_text.contains("<|\"|>"), "raw={raw:?} -> {:?}", r.normal_text);
+        }
+    }
+
+    // Properly opened channels keep the existing behaviour.
+    #[test]
+    fn proper_channel_unchanged() {
+        let mut p = Gemma4ReasoningParser::new();
+        let r = p.detect_and_parse_reasoning("<|channel>thought\nplan<channel|>answer", &[]);
+        assert_eq!(r.reasoning_text, "plan");
+        assert_eq!(r.normal_text, "answer");
+    }
+
+
+    // finish() returns only what was not streamed yet (trait contract).
+    #[test]
+    fn finish_does_not_duplicate_streamed_content() {
+        let mut p = Gemma4ReasoningParser::new();
+        let mut normal = String::new();
+        for c in ["Hello", " world", ", how are you?"] {
+            normal.push_str(&p.parse_reasoning_streaming_incremental(c, &[]).normal_text);
+        }
+        let tail = p.finish_reasoning_stream();
+        normal.push_str(&tail.normal_text);
+        assert_eq!(normal, "Hello world, how are you?");
+        assert!(tail.reasoning_text.is_empty());
+    }
+
+    // An orphan label + short answer is held (it might still be closed) and must be
+    // released by finish(), label stripped.
+    #[test]
+    fn held_orphan_label_released_on_finish() {
+        let mut p = Gemma4ReasoningParser::new();
+        let mut normal = String::new();
+        for c in ["thought", "\n", "OK."] {
+            normal.push_str(&p.parse_reasoning_streaming_incremental(c, &[]).normal_text);
+        }
+        assert_eq!(normal, "", "held until the label is resolved");
+        normal.push_str(&p.finish_reasoning_stream().normal_text);
+        assert_eq!(normal, "OK.");
+    }
+
+    // An incomplete-marker tail kept back during streaming is flushed by finish().
+    #[test]
+    fn finish_flushes_trailing_incomplete_marker_text() {
+        let mut p = Gemma4ReasoningParser::new();
+        let mut normal = String::new();
+        for c in ["Answer is 5 <", "|"] {
+            normal.push_str(&p.parse_reasoning_streaming_incremental(c, &[]).normal_text);
+        }
+        normal.push_str(&p.finish_reasoning_stream().normal_text);
+        assert_eq!(normal, "Answer is 5 <|");
+    }
+
 }

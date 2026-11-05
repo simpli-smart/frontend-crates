@@ -82,16 +82,36 @@ fn find_balanced_args_end(input: &str, open_brace: usize) -> Option<usize> {
     let mut cursor = open_brace;
     let mut depth = 0usize;
     let mut in_string = false;
+    // JSON-style "..." string outside a `<|"|>` string (model drift away from the
+    // native grammar); braces inside it must not change the depth.
+    let mut in_json_string = false;
+    let mut escaped = false;
 
     while cursor < input.len() {
         let rest = &input[cursor..];
-        if rest.starts_with(STRING_DELIM) {
+        if !in_json_string && rest.starts_with(STRING_DELIM) {
             in_string = !in_string;
             cursor += STRING_DELIM.len();
             continue;
         }
 
         let ch = rest.chars().next()?;
+        if in_json_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_json_string = false;
+            }
+            cursor += ch.len_utf8();
+            continue;
+        }
+        if !in_string && ch == '"' {
+            in_json_string = true;
+            cursor += ch.len_utf8();
+            continue;
+        }
         if !in_string {
             match ch {
                 '{' => depth += 1,
@@ -215,7 +235,26 @@ fn has_bare_call_body_start(input: &str) -> bool {
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
 }
 
+/// Longest function name we keep holding while waiting for `{` after a bare `call:`.
+const MAX_HELD_CALL_NAME: usize = 128;
+
+fn is_call_name_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')
+}
+
 pub fn split_partial_call_prefix_gemma4(chunk: &str) -> Option<(&str, &str)> {
+    // A bare `call:<name>` with no `{` yet may still become a call (Gemma 4 sometimes
+    // drops the `<|tool_call>` opener). Hold it so its first bytes cannot leak as
+    // content before the jail sees `call:<name>{`; a following non-name char releases it.
+    if let Some(idx) = chunk.rfind(CALL_PREFIX)
+        && is_call_prefix_boundary(chunk, idx)
+    {
+        let name = &chunk[idx + CALL_PREFIX.len()..];
+        if !name.is_empty() && name.len() <= MAX_HELD_CALL_NAME && name.chars().all(is_call_name_char)
+        {
+            return Some((&chunk[..idx], &chunk[idx..]));
+        }
+    }
     for i in 1..=CALL_PREFIX.len() {
         if !CALL_PREFIX.is_char_boundary(i) || !chunk.ends_with(&CALL_PREFIX[..i]) {
             continue;
@@ -399,6 +438,29 @@ pub fn try_tool_call_parse_gemma4(
         &mut calls,
         &mut first_tool_start,
     )?;
+
+    // A fully bare call (no `<|tool_call>` and no `<tool_call|>`) is only recovered when
+    // it is the whole message and names a declared tool: Gemma 4 sometimes re-issues a
+    // call after a tool response with both markers dropped, and nothing else in the
+    // output. Embedded `call:x{...}` inside prose is still left alone.
+    if calls.is_empty() {
+        let trimmed = message.trim();
+        let lead = message.len() - message.trim_start().len();
+        if trimmed.starts_with(CALL_PREFIX)
+            && let Some(recovered) = parse_recoverable_call_at(trimmed, true, true)
+            && recovered.2 == trimmed.len()
+            && tools.is_none_or(|t| t.iter().any(|d| d.name == recovered.0))
+        {
+            push_recovered_call(
+                &mut calls,
+                &mut first_tool_start,
+                lead,
+                recovered,
+                tools,
+                "bare_whole_message_recovery",
+            )?;
+        }
+    }
 
     // No-leak contract for `normal_text`:
     //   - Success path (≥1 call extracted): prefix BEFORE the first
@@ -621,7 +683,38 @@ fn parse_object_body(cur: &mut Cursor) -> anyhow::Result<Value> {
     Ok(Value::Object(map))
 }
 
+/// Parse a JSON string literal at the cursor (opening `"` included). In partial mode an
+/// unterminated string yields what has arrived so far.
+fn parse_json_string(cur: &mut Cursor) -> anyhow::Result<String> {
+    let start = cur.pos;
+    let bytes = cur.src.as_bytes();
+    let mut i = start + 1;
+    let mut escaped = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            _ if escaped => escaped = false,
+            b'\\' => escaped = true,
+            b'"' => {
+                let lit = &cur.src[start..=i];
+                cur.pos = i + 1;
+                return serde_json::from_str::<String>(lit)
+                    .map_err(|e| anyhow::anyhow!("invalid JSON string at offset {start}: {e}"));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if cur.partial {
+        cur.pos = bytes.len();
+        return Ok(cur.src[start + 1..].to_string());
+    }
+    anyhow::bail!("unterminated JSON string at offset {}", start)
+}
+
 fn parse_key(cur: &mut Cursor) -> anyhow::Result<String> {
+    if cur.peek_byte() == Some(b'"') {
+        return parse_json_string(cur);
+    }
     let bytes = cur.src.as_bytes();
     let start = cur.pos;
     while cur.pos < bytes.len() {
@@ -680,6 +773,11 @@ fn parse_value(cur: &mut Cursor) -> anyhow::Result<Value> {
                 return Ok(Value::String(s));
             }
         }
+    }
+
+    // JSON-style "..." string (the model sometimes copies JSON quoting from history).
+    if cur.peek_byte() == Some(b'"') {
+        return parse_json_string(cur).map(Value::String);
     }
 
     // Object
@@ -1227,4 +1325,67 @@ mod tests {
     // TOOLCALLING.xml.1 / TOOLCALLING.xml.2 — XML-family only. N/A — Gemma 4 uses a custom
     //           non-JSON, non-XML grammar.
     // TOOLCALLING.harmony.1 / TOOLCALLING.harmony.2 — Harmony only. N/A.
+
+    // Streaming jail: a bare `call:<name>` is held until `{` arrives (it leaked as
+    // content when the first chunk was `call:get`), and released if it is prose.
+    #[test]
+    fn split_holds_bare_call_name_until_brace() {
+        assert_eq!(split_partial_call_prefix_gemma4("call:get"), Some(("", "call:get")));
+        assert_eq!(
+            split_partial_call_prefix_gemma4("Sure. call:get_order_status"),
+            Some(("Sure. ", "call:get_order_status"))
+        );
+        // `{` arrived: the jail's start detector takes over.
+        assert!(detect_tool_call_start_gemma4("call:get_order_status{"));
+        // Prose: a space after the name means it was never a call.
+        assert_eq!(split_partial_call_prefix_gemma4("call:me maybe"), None);
+        assert_eq!(split_partial_call_prefix_gemma4("recall:x"), None);
+        // Existing partial-prefix behaviour unchanged.
+        assert_eq!(split_partial_call_prefix_gemma4("ok ca"), Some(("ok ", "ca")));
+    }
+
+    // JSON-quoted values / keys (model copying JSON from history) parse to real args
+    // instead of falling back to `{}`.
+    #[test]
+    fn parse_json_quoted_args() {
+        let msg = r#"call:get_order_status{call_sid: "aa11-bb22", language_preference: "Arabic", "mobile_number": "62222207", n: 3}"#;
+        let (calls, normal) = try_tool_call_parse_gemma4(msg, None).unwrap();
+        assert_eq!(calls.len(), 1);
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["call_sid"], "aa11-bb22");
+        assert_eq!(args["language_preference"], "Arabic");
+        assert_eq!(args["mobile_number"], "62222207");
+        assert_eq!(args["n"], 3);
+        assert_eq!(normal.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn json_string_with_braces_and_escapes() {
+        let msg = r#"<|tool_call>call:f{q: "a {b} \"c\" }", k:<|"|>v<|"|>}<tool_call|>"#;
+        let (calls, _) = try_tool_call_parse_gemma4(msg, None).unwrap();
+        assert_eq!(calls.len(), 1);
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["q"], "a {b} \"c\" }");
+        assert_eq!(args["k"], "v");
+    }
+
+    // Native `<|"|>` strings containing a `"` are unaffected by JSON-string tracking.
+    #[test]
+    fn native_string_with_double_quote_unchanged() {
+        let msg = r#"<|tool_call>call:f{text:<|"|>He said "hi" {ok}<|"|>}<tool_call|>"#;
+        let (calls, _) = try_tool_call_parse_gemma4(msg, None).unwrap();
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["text"], "He said \"hi\" {ok}");
+    }
+
+
+    // Prose that mentions the call syntax is not turned into a tool call.
+    #[test]
+    fn bare_call_inside_prose_not_recovered() {
+        let msg = "To check, use call:get_order_status{awb: \"1\"} with your AWB.";
+        let (calls, normal) = try_tool_call_parse_gemma4(msg, None).unwrap();
+        assert!(calls.is_empty());
+        assert_eq!(normal.as_deref(), Some(msg));
+    }
+
 }

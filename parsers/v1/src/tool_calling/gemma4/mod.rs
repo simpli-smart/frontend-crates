@@ -10,7 +10,9 @@ pub use format::{
     extract_tool_handoff_text, strip_trailing_incomplete_token, ReasoningSnapshot,
     StreamingContentCleaner,
 };
-pub(crate) use format::{CHANNEL_END, CHANNEL_START};
+pub(crate) use format::{
+    normalize_opener_less, opener_less_undecided, CHANNEL_END, CHANNEL_START,
+};
 pub use parser::{
     detect_tool_call_start_gemma4, find_tool_call_end_position_gemma4,
     parse_args_object_partial, split_partial_call_prefix_gemma4,
