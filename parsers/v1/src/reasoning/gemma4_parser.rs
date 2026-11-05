@@ -15,6 +15,8 @@
 //! Parsing semantics align with vLLM/SGLang ``Gemma4Detector`` (snapshot-based
 //! streaming on incomplete-marker-safe prefixes).
 
+use std::borrow::Cow;
+
 use crate::ParserResult;
 use crate::ReasoningParser;
 use crate::tool_calling::gemma4::{
@@ -32,6 +34,29 @@ pub struct Gemma4ReasoningParser {
     last_safe_text: String,
     /// Client-visible content already emitted (avoids duplicate pre-channel text).
     emitted_content: String,
+}
+
+/// Channel role label the model writes right after `<|channel>`.
+const THOUGHT_PREFIX: &str = "thought\n";
+
+/// Gemma 4 sometimes opens its (often empty) thought block without the `<|channel>`
+/// token, e.g. on post-tool turns: `thought\n<channel|>Great news...`. vLLM injects the
+/// missing opener for a bare `thought` prefix (simpli-smart/vllm 7fcf96161f); do the same so
+/// the label and the dangling `<channel|>` never reach `content`.
+fn normalize_bare_thought_prefix(text: &str) -> Cow<'_, str> {
+    let body = text.trim_start();
+    if body.starts_with(THOUGHT_PREFIX) {
+        let ws = &text[..text.len() - body.len()];
+        return Cow::Owned(format!("{ws}{CHANNEL_START}{body}"));
+    }
+    Cow::Borrowed(text)
+}
+
+/// True while the stream could still turn into a bare `thought\n` prefix
+/// (whitespace only, or a strict prefix of `thought\n` after whitespace).
+fn bare_thought_prefix_undecided(text: &str) -> bool {
+    let body = text.trim_start();
+    body.is_empty() || (body.len() < THOUGHT_PREFIX.len() && THOUGHT_PREFIX.starts_with(body))
 }
 
 impl Gemma4ReasoningParser {
@@ -72,7 +97,8 @@ impl Default for Gemma4ReasoningParser {
 
 impl ReasoningParser for Gemma4ReasoningParser {
     fn detect_and_parse_reasoning(&mut self, text: &str, _token_ids: &[u32]) -> ParserResult {
-        Self::snapshot_to_parser_result(&extract_reasoning_non_streaming(text))
+        let text = normalize_bare_thought_prefix(text);
+        Self::snapshot_to_parser_result(&extract_reasoning_non_streaming(&text))
     }
 
     fn parse_reasoning_streaming_incremental(
@@ -82,7 +108,13 @@ impl ReasoningParser for Gemma4ReasoningParser {
     ) -> ParserResult {
         self.prev_cumulative_text = self.cumulative_text.clone();
         self.cumulative_text.push_str(text);
-        let safe_curr = strip_trailing_incomplete_token(&self.cumulative_text);
+        // Hold output until we know whether it opens with a bare `thought\n` label.
+        if bare_thought_prefix_undecided(&self.cumulative_text) {
+            return ParserResult::default();
+        }
+        let norm_curr = normalize_bare_thought_prefix(&self.cumulative_text).into_owned();
+        let norm_prev = normalize_bare_thought_prefix(&self.prev_cumulative_text).into_owned();
+        let safe_curr = strip_trailing_incomplete_token(&norm_curr);
 
         if safe_curr == self.last_safe_text {
             return ParserResult::default();
@@ -101,8 +133,8 @@ impl ReasoningParser for Gemma4ReasoningParser {
         };
 
         // Pre-channel text must not be emitted twice once the channel opens.
-        let channel_just_opened = !self.prev_cumulative_text.contains(CHANNEL_START)
-            && self.cumulative_text.contains(CHANNEL_START);
+        let channel_just_opened =
+            !norm_prev.contains(CHANNEL_START) && norm_curr.contains(CHANNEL_START);
         if channel_just_opened {
             prev_snapshot.content = None;
         }
@@ -112,7 +144,7 @@ impl ReasoningParser for Gemma4ReasoningParser {
 
         let (dr, mut dc) = diff_reasoning_streaming_snapshots(&curr_snapshot, &prev_snapshot);
 
-        let suppress_content = Self::inside_open_first_channel(&self.cumulative_text);
+        let suppress_content = Self::inside_open_first_channel(&norm_curr);
         if suppress_content {
             dc.clear();
         } else if let Some(ref full) = curr_snapshot.content {
@@ -140,6 +172,7 @@ impl ReasoningParser for Gemma4ReasoningParser {
         self.last_safe_text.clear();
         self.emitted_content.clear();
 
+        let full = normalize_bare_thought_prefix(&full);
         let final_snapshot = extract_reasoning_non_streaming(&full);
         Self::snapshot_to_parser_result(&final_snapshot)
     }
@@ -195,12 +228,69 @@ mod tests {
         assert_eq!(r.normal_text, "some thinking<channel|>final answer");
     }
 
+    // Bare `thought\n` with no `<|channel>` opener is an implicitly opened channel
+    // (matches vLLM's gemma4 parser): the label and `<channel|>` must not reach content.
     #[test]
-    fn detect_dangling_end_with_thought_prefix_in_content() {
+    fn detect_bare_thought_prefix_is_reasoning() {
         let mut p = Gemma4ReasoningParser::new();
         let r = p.detect_and_parse_reasoning("thought\nrumination<channel|>final answer", &[]);
+        assert_eq!(r.reasoning_text, "rumination");
+        assert_eq!(r.normal_text, "final answer");
+    }
+
+    // Exact shape captured from the Exotel leakage suite (post-tool turns).
+    #[test]
+    fn detect_bare_empty_thought_post_tool() {
+        for raw in [
+            "thought\n<channel|>Great news, Rajesh!",
+            "\nthought\n<channel|>Great news, Rajesh!",
+        ] {
+            let mut p = Gemma4ReasoningParser::new();
+            let r = p.detect_and_parse_reasoning(raw, &[]);
+            assert!(!r.normal_text.contains("thought"), "{raw:?} -> {:?}", r.normal_text);
+            assert!(!r.normal_text.contains("<channel|>"), "{raw:?} -> {:?}", r.normal_text);
+            assert_eq!(r.normal_text.trim(), "Great news, Rajesh!");
+        }
+    }
+
+    #[test]
+    fn streaming_bare_empty_thought_post_tool() {
+        for chunks in [
+            vec!["thought", "\n", "<channel|>", "Great", " news", ", Rajesh!"],
+            vec!["\n", "thought", "\n", "<channel|>", "Great news, Rajesh!"],
+            vec!["thou", "ght\n<channel|>Great news, Rajesh!"],
+        ] {
+            let mut p = Gemma4ReasoningParser::new();
+            let mut normal = String::new();
+            let mut reasoning = String::new();
+            for c in &chunks {
+                let r = p.parse_reasoning_streaming_incremental(c, &[]);
+                normal.push_str(&r.normal_text);
+                reasoning.push_str(&r.reasoning_text);
+            }
+            assert!(!normal.contains("thought"), "{chunks:?} -> {normal:?}");
+            assert!(!normal.contains("<channel|>"), "{chunks:?} -> {normal:?}");
+            assert_eq!(normal.trim(), "Great news, Rajesh!", "{chunks:?}");
+            assert!(reasoning.trim().is_empty(), "{chunks:?} -> reasoning {reasoning:?}");
+        }
+    }
+
+    // The word "thought" mid-answer is ordinary content.
+    #[test]
+    fn thought_word_in_answer_is_content() {
+        let mut p = Gemma4ReasoningParser::new();
+        let r = p.detect_and_parse_reasoning("I thought about it.\nThe answer is 42.", &[]);
         assert_eq!(r.reasoning_text, "");
-        assert!(r.normal_text.contains("<channel|>"));
+        assert_eq!(r.normal_text, "I thought about it.\nThe answer is 42.");
+    }
+
+    // Short answers that are a prefix of "thought" must still be emitted at stream end.
+    #[test]
+    fn streaming_short_prefix_flushed_on_finish() {
+        let mut p = Gemma4ReasoningParser::new();
+        let r1 = p.parse_reasoning_streaming_incremental("th", &[]);
+        let r2 = p.finish_reasoning_stream();
+        assert_eq!(format!("{}{}", r1.normal_text, r2.normal_text), "th");
     }
 
     #[test]
