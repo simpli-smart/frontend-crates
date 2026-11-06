@@ -44,6 +44,10 @@ use uuid::Uuid;
 
 use crate::tool_calling::config::{JsonParserConfig, ParserConfig, TerminalMarkerPolicy};
 use crate::tool_calling::gemma4::split_partial_call_prefix_gemma4;
+use crate::tool_calling::gemma4::{
+    STRING_DELIM as GEMMA4_STRING_DELIM, TOOL_CALL_END as GEMMA4_TOOL_CALL_END,
+    TOOL_CALL_START as GEMMA4_TOOL_CALL_START,
+};
 use crate::tool_calling::json::base_json_parser::parse_indexed_calls;
 use crate::tool_calling::json::{JsonParserType, try_tool_call_parse_basic_json};
 use crate::tool_calling::parsers::get_tool_parser_map;
@@ -357,6 +361,8 @@ struct ChoiceJailState {
     is_jailed: bool,
     /// Accumulated content for this choice while jailed
     accumulated_content: String,
+    /// Non-whitespace text or a tool call has been emitted for this choice.
+    visible_output_emitted: bool,
     /// Accumulated logprobs for this choice while jailed.
     /// Logprobs from each jailed chunk are appended so the full token-level
     /// log-probability information is preserved when the jail emits.
@@ -397,6 +403,11 @@ struct JailCompletionProgress {
     pending_end_marker: Option<usize>,
     pending_parse: Option<ParsedToolCalls>,
     json: JsonCompletionProgress,
+    /// Text or a tool call reached the client before this jail began. A fully bare
+    /// gemma4 `call:x{...}` (no `<|tool_call>` / `<tool_call|>`) is then prose that
+    /// mentions the syntax, not a call: the parser only recovers one that is the
+    /// whole message, and the jailed buffer is not the whole message.
+    after_visible_output: bool,
 }
 
 impl JailCompletionProgress {
@@ -694,6 +705,7 @@ impl ChoiceJailState {
             index,
             is_jailed: starts_jailed,
             accumulated_content: String::new(),
+            visible_output_emitted: false,
             accumulated_logprobs: None,
             partial_match_buffer: String::new(),
             partial_logprobs_buffer: None,
@@ -767,6 +779,19 @@ impl ChoiceJailState {
         self.accumulated_logprobs = logprobs;
         self.held_after_contentless.clear();
         self.completion_progress.reset();
+        self.completion_progress.after_visible_output = self.visible_output_emitted;
+    }
+
+    /// Record client-visible output (see `JailCompletionProgress::after_visible_output`).
+    fn note_emitted(&mut self, emissions: &[ChoiceEmission]) {
+        if self.visible_output_emitted {
+            return;
+        }
+        self.visible_output_emitted = emissions.iter().any(|e| {
+            let delta = &e.choice().delta;
+            delta.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
+                || matches!(&delta.content, Some(ChatCompletionMessageContent::Text(t)) if !t.trim().is_empty())
+        });
     }
 
     /// Add content and logprobs to this choice's accumulation
@@ -1010,6 +1035,7 @@ impl ChoiceJailState {
                     format!("{marker}{suffix}")
                 };
                 let remaining = self.take_held_entries();
+                self.note_emitted(emissions.as_slice());
                 self.begin_jail(jailed, remaining);
                 return;
             }
@@ -1033,6 +1059,7 @@ impl ChoiceJailState {
             self.partial_match_buffer = partial.to_string();
         } else if jail_stream.should_start_jail(content) {
             let remaining = self.take_held_entries();
+            self.note_emitted(emissions.as_slice());
             self.begin_jail(content.to_string(), remaining);
         } else {
             let all = self.take_held_entries();
@@ -1227,6 +1254,7 @@ impl ChoiceJailState {
                 self.emitted_tool_calls_count,
                 false,
                 completed.marker_parse_result,
+                self.completion_progress.after_visible_output,
             )
             .await;
         unjailed_choice.logprobs = jail_logprobs;
@@ -1319,6 +1347,7 @@ impl ChoiceJailState {
                     };
 
                     let remaining = self.take_held_entries();
+                    self.note_emitted(emissions.as_slice());
                     self.begin_jail(full_content, remaining);
                     let completion = jail_stream
                         .check_jail_completion(
@@ -1343,6 +1372,7 @@ impl ChoiceJailState {
                         && contains_harmony_protocol(&prefix)
                     {
                         let remaining = self.take_held_entries();
+                        self.note_emitted(emissions.as_slice());
                         self.begin_jail(format!("{}{}", prefix, partial), remaining);
                         self.partial_match_buffer.clear();
                         return emissions;
@@ -1394,6 +1424,7 @@ impl ChoiceJailState {
                         self.partial_match_buffer = partial.to_string();
                     } else if jail_stream.should_start_jail(&content) {
                         let remaining = self.take_held_entries();
+                        self.note_emitted(emissions.as_slice());
                         self.begin_jail(content, remaining);
                         self.partial_match_buffer.clear();
                     } else {
@@ -1604,6 +1635,7 @@ impl ChoiceJailState {
                     self.emitted_tool_calls_count,
                     true, // finalize: enable EOF recovery for missing-end-token / truncated-JSON
                     None,
+                    self.completion_progress.after_visible_output,
                 )
                 .await;
             // Attach the full accumulated logprobs to the final choice
@@ -1876,6 +1908,7 @@ impl JailedStream {
                                 // Process this choice and get emissions
                                 let had_tool_calls_before = choice_state.emitted_tool_calls_count > 0;
                                 let mut emissions = choice_state.process_content(choice, text, &self).await;
+                                choice_state.note_emitted(&emissions);
                                 choice_state.hold_terminal_suffix(
                                     &mut emissions,
                                     self.terminal_marker_policy,
@@ -2244,19 +2277,57 @@ impl JailedStream {
         found
     }
 
-    async fn parse_marker_tool_calls(&self, accumulated_content: &str) -> MarkerParseResult {
-        try_tool_call_parse_aggregate(
+    async fn parse_marker_tool_calls(
+        &self,
+        accumulated_content: &str,
+        after_visible_output: bool,
+    ) -> MarkerParseResult {
+        let parsed = try_tool_call_parse_aggregate(
             accumulated_content,
             self.tool_call_parser.as_deref(),
             self.tool_definitions.as_deref(),
         )
-        .await
+        .await;
+        self.reject_bare_call_after_output(accumulated_content, after_visible_output, parsed)
+    }
+
+    /// Gemma 4: a call with neither `<|tool_call>` nor `<tool_call|>` is only recovered
+    /// when it is the whole message. In the jail the buffer starts at the call, so that
+    /// holds only if nothing reached the client before it; otherwise the same text
+    /// would become a call or stay prose depending on where the chunks split.
+    fn reject_bare_call_after_output(
+        &self,
+        accumulated_content: &str,
+        after_visible_output: bool,
+        parsed: MarkerParseResult,
+    ) -> MarkerParseResult {
+        let bare = self.tool_call_parser.as_deref() == Some("gemma4")
+            && !accumulated_content.contains(GEMMA4_TOOL_CALL_START)
+            && !accumulated_content.contains(GEMMA4_TOOL_CALL_END);
+        match parsed {
+            Ok((calls, _)) if bare && after_visible_output && !calls.is_empty() => {
+                tracing::debug!(
+                    why = "bare_call_after_visible_output",
+                    "gemma4: not recovering a marker-less call that follows emitted output"
+                );
+                // Same outcome as the parser's no-call paths: plain text passes through,
+                // native string delimiters are suppressed.
+                let normal = if accumulated_content.contains(GEMMA4_STRING_DELIM) {
+                    String::new()
+                } else {
+                    accumulated_content.to_string()
+                };
+                Ok((Vec::new(), Some(normal)))
+            }
+            other => other,
+        }
     }
 
     async fn completion_from_parsed_tool_calls(
         &self,
         accumulated_content: &str,
         parsed: ParsedToolCalls,
+        after_visible_output: bool,
     ) -> ParsedCompletion {
         let Some(parser) = self.tool_call_parser.as_deref() else {
             return ParsedCompletion::Invalid;
@@ -2266,7 +2337,7 @@ impl JailedStream {
         };
         let marker_parse_result = if split_pos < accumulated_content.len() {
             match self
-                .parse_marker_tool_calls(&accumulated_content[..split_pos])
+                .parse_marker_tool_calls(&accumulated_content[..split_pos], after_visible_output)
                 .await
             {
                 Ok(reparsed) if !reparsed.0.is_empty() => Some(Ok(reparsed)),
@@ -2304,7 +2375,7 @@ impl JailedStream {
                         return JailCompletion::Incomplete;
                     };
                     let marker_parse_result = match self
-                        .parse_marker_tool_calls(&accumulated_content[..split_pos])
+                        .parse_marker_tool_calls(&accumulated_content[..split_pos], progress.after_visible_output)
                         .await
                     {
                         Ok(parsed) if !parsed.0.is_empty() => Some(Ok(parsed)),
@@ -2318,7 +2389,7 @@ impl JailedStream {
 
                 if let Some(parsed) = progress.pending_parse.take() {
                     match self
-                        .completion_from_parsed_tool_calls(accumulated_content, parsed)
+                        .completion_from_parsed_tool_calls(accumulated_content, parsed, progress.after_visible_output)
                         .await
                     {
                         ParsedCompletion::Complete(completed) => {
@@ -2341,10 +2412,10 @@ impl JailedStream {
                         });
                     }
 
-                    match self.parse_marker_tool_calls(accumulated_content).await {
+                    match self.parse_marker_tool_calls(accumulated_content, progress.after_visible_output).await {
                         Ok(parsed) if !parsed.0.is_empty() => {
                             match self
-                                .completion_from_parsed_tool_calls(accumulated_content, parsed)
+                                .completion_from_parsed_tool_calls(accumulated_content, parsed, progress.after_visible_output)
                                 .await
                             {
                                 ParsedCompletion::Complete(completed) => {
@@ -2378,11 +2449,13 @@ impl JailedStream {
                 };
 
                 if should_parse
-                    && let Ok(parsed) = self.parse_marker_tool_calls(accumulated_content).await
+                    && let Ok(parsed) = self
+                        .parse_marker_tool_calls(accumulated_content, progress.after_visible_output)
+                        .await
                     && !parsed.0.is_empty()
                 {
                     match self
-                        .completion_from_parsed_tool_calls(accumulated_content, parsed)
+                        .completion_from_parsed_tool_calls(accumulated_content, parsed, progress.after_visible_output)
                         .await
                     {
                         ParsedCompletion::Complete(completed) => {
@@ -2440,6 +2513,7 @@ impl JailedStream {
         tool_call_offset: usize,
         is_finalize: bool,
         marker_parse_result: Option<MarkerParseResult>,
+        after_visible_output: bool,
     ) -> ChatChoiceStream {
         match &self.jail_mode {
             JailMode::MarkerBased => {
@@ -2447,14 +2521,15 @@ impl JailedStream {
                 let parse_result = if let Some(parse_result) = marker_parse_result {
                     parse_result
                 } else if is_finalize {
-                    try_tool_call_parse_aggregate_finalize(
+                    let parsed = try_tool_call_parse_aggregate_finalize(
                         accumulated_content,
                         self.tool_call_parser.as_deref(),
                         self.tool_definitions.as_deref(),
                     )
-                    .await
+                    .await;
+                    self.reject_bare_call_after_output(accumulated_content, after_visible_output, parsed)
                 } else {
-                    self.parse_marker_tool_calls(accumulated_content).await
+                    self.parse_marker_tool_calls(accumulated_content, after_visible_output).await
                 };
                 match parse_result {
                     Ok((tool_calls, normal_text)) if !tool_calls.is_empty() => {
@@ -5576,5 +5651,69 @@ mod tests {
             .position(|c| c.delta.tool_calls.as_ref().is_some_and(|t| !t.is_empty()))
             .expect("call emitted");
         assert!(reasoning_at < call_at, "reasoning must precede the call");
+    }
+
+    async fn run_gemma4_jail(chunks: &[&str]) -> (String, Vec<(String, String)>) {
+        let tools = vec![crate::tool_calling::ToolDefinition {
+            name: "get_order_status".to_string(),
+            parameters: None,
+            strict: None,
+        }];
+        let jail = JailedStream::builder()
+            .tool_call_parser("gemma4".to_string())
+            .tool_definitions(tools)
+            .build();
+        let mut input: Vec<_> = chunks.iter().map(|c| text_chunk(c)).collect();
+        let mut terminal = terminal_chunk();
+        terminal.data.as_mut().unwrap().choices[0].finish_reason = Some(FinishReason::Stop);
+        input.push(terminal);
+        let responses: Vec<_> = jail.apply(stream::iter(input)).collect().await;
+        (collect_text_content(&responses), collect_tool_calls(&responses))
+    }
+
+    // Review finding 3: prose followed by a marker-less `call:x{...}` stays prose however
+    // the chunks split (it became a tool call when the call started in its own chunk).
+    #[tokio::test]
+    async fn gemma4_bare_call_after_prose_is_prose_for_any_split() {
+        let text = "To check, use call:get_order_status{awb: \"1\"}";
+        for chunks in [
+            vec!["To check, use ", "call:get_order_status", "{awb: \"1\"}"],
+            vec!["To check, use ", "call:get_order_status{awb: \"1\"}"],
+            vec!["To check, use call:get_order_status", "{awb: \"1\"}"],
+            vec![text],
+        ] {
+            let (content, calls) = run_gemma4_jail(&chunks).await;
+            assert!(calls.is_empty(), "{chunks:?} -> {calls:?}");
+            assert_eq!(content, text, "{chunks:?}");
+        }
+    }
+
+    // A message that is only a marker-less call naming a declared tool is still a call.
+    #[tokio::test]
+    async fn gemma4_whole_message_bare_call_still_recovered() {
+        for chunks in [
+            vec!["call:get_order_status{awb: \"1\"}"],
+            vec!["call:get", "_order_status", "{awb: ", "\"1\"}"],
+            vec!["\n", "call:get_order_status{awb: \"1\"}"],
+        ] {
+            let (content, calls) = run_gemma4_jail(&chunks).await;
+            assert_eq!(calls.len(), 1, "{chunks:?}");
+            assert_eq!(calls[0].0, "get_order_status");
+            assert_eq!(content.trim(), "", "{chunks:?}");
+        }
+    }
+
+    // Calls with real markers after prose are unaffected.
+    #[tokio::test]
+    async fn gemma4_marked_call_after_prose_still_parsed() {
+        let (content, calls) = run_gemma4_jail(&[
+            "Checking now. ",
+            "<|tool_call>",
+            "call:get_order_status{awb:<|\"|>1<|\"|>}",
+            "<tool_call|>",
+        ])
+        .await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(content.trim(), "Checking now.");
     }
 }
