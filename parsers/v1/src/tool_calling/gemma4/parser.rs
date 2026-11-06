@@ -83,14 +83,18 @@ fn find_balanced_args_end(input: &str, open_brace: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut in_string = false;
     // JSON-style "..." string outside a `<|"|>` string (model drift away from the
-    // native grammar); braces inside it must not change the depth.
+    // native grammar); braces inside it must not change the depth. Only a `"` where a
+    // key or value starts opens one, so a stray quote inside a bare native value
+    // (`size:5"`) does not swallow the rest of the call.
     let mut in_json_string = false;
     let mut escaped = false;
+    let mut last_sig = '{';
 
     while cursor < input.len() {
         let rest = &input[cursor..];
         if !in_json_string && rest.starts_with(STRING_DELIM) {
             in_string = !in_string;
+            last_sig = '"';
             cursor += STRING_DELIM.len();
             continue;
         }
@@ -103,16 +107,20 @@ fn find_balanced_args_end(input: &str, open_brace: usize) -> Option<usize> {
                 escaped = true;
             } else if ch == '"' {
                 in_json_string = false;
+                last_sig = '"';
             }
             cursor += ch.len_utf8();
             continue;
         }
-        if !in_string && ch == '"' {
+        if !in_string && ch == '"' && matches!(last_sig, '{' | ',' | ':' | '[') {
             in_json_string = true;
             cursor += ch.len_utf8();
             continue;
         }
         if !in_string {
+            if !ch.is_whitespace() {
+                last_sig = ch;
+            }
             match ch {
                 '{' => depth += 1,
                 '}' => {
@@ -447,16 +455,18 @@ pub fn try_tool_call_parse_gemma4(
     )?;
 
     // A fully bare call (no `<|tool_call>` and no `<tool_call|>`) is only recovered when
-    // it is the whole message and names a declared tool: Gemma 4 sometimes re-issues a
-    // call after a tool response with both markers dropped, and nothing else in the
-    // output. Embedded `call:x{...}` inside prose is still left alone.
+    // it is the whole message and names a tool the request declared (no tool list, no
+    // recovery): Gemma 4 sometimes re-issues a call after a tool response with both
+    // markers dropped, and nothing else in the output. Embedded `call:x{...}` inside
+    // prose is left alone; the streaming jail applies the same rule to its buffer (see
+    // `reject_bare_call_after_output`).
     if calls.is_empty() {
         let trimmed = message.trim();
         let lead = message.len() - message.trim_start().len();
         if trimmed.starts_with(CALL_PREFIX)
             && let Some(recovered) = parse_recoverable_call_at(trimmed, true, true)
             && recovered.2 == trimmed.len()
-            && tools.is_none_or(|t| t.iter().any(|d| d.name == recovered.0))
+            && tools.is_some_and(|t| t.iter().any(|d| d.name == recovered.0))
         {
             push_recovered_call(
                 &mut calls,
@@ -713,7 +723,11 @@ fn parse_json_string(cur: &mut Cursor) -> anyhow::Result<String> {
     }
     if cur.partial {
         cur.pos = bytes.len();
-        return Ok(cur.src[start + 1..].to_string());
+        // Decode what has arrived (a dangling `\` is an escape still in flight).
+        let body = &cur.src[start + 1..];
+        let body = if escaped { &body[..body.len() - 1] } else { body };
+        return Ok(serde_json::from_str::<String>(&format!("\"{body}\""))
+            .unwrap_or_else(|_| body.to_string()));
     }
     anyhow::bail!("unterminated JSON string at offset {}", start)
 }
@@ -1356,7 +1370,12 @@ mod tests {
     #[test]
     fn parse_json_quoted_args() {
         let msg = r#"call:get_order_status{call_sid: "aa11-bb22", language_preference: "Arabic", "mobile_number": "62222207", n: 3}"#;
-        let (calls, normal) = try_tool_call_parse_gemma4(msg, None).unwrap();
+        let tools = [ToolDefinition {
+            name: "get_order_status".to_string(),
+            parameters: None,
+            strict: None,
+        }];
+        let (calls, normal) = try_tool_call_parse_gemma4(msg, Some(&tools)).unwrap();
         assert_eq!(calls.len(), 1);
         let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["call_sid"], "aa11-bb22");
@@ -1378,6 +1397,22 @@ mod tests {
 
     // Native `<|"|>` strings containing a `"` are unaffected by JSON-string tracking.
     #[test]
+    fn stray_quote_in_bare_value_does_not_break_call() {
+        // A `"` inside a bare value is not a JSON string start: the closing brace is found.
+        let args = r#"{size:5", n:<|"|>x<|"|>}"#;
+        assert_eq!(find_balanced_args_end(args, 0), Some(args.len() - 1));
+        // A real JSON string still hides its braces.
+        let args = r#"{q: "a } b", n:1}"#;
+        assert_eq!(find_balanced_args_end(args, 0), Some(args.len() - 1));
+    }
+
+    #[test]
+    fn partial_json_string_is_unescaped() {
+        let v = parse_args_object_partial(r#"q: "a \"b\" \u00e9 c\"#);
+        assert_eq!(v["q"], "a \"b\" é c");
+    }
+
+    #[test]
     fn native_string_with_double_quote_unchanged() {
         let msg = r#"<|tool_call>call:f{text:<|"|>He said "hi" {ok}<|"|>}<tool_call|>"#;
         let (calls, _) = try_tool_call_parse_gemma4(msg, None).unwrap();
@@ -1387,6 +1422,14 @@ mod tests {
 
 
     // Prose that mentions the call syntax is not turned into a tool call.
+    #[test]
+    fn bare_whole_message_needs_declared_tool() {
+        let msg = r#"call:get_order_status{awb: "1"}"#;
+        assert!(try_tool_call_parse_gemma4(msg, None).unwrap().0.is_empty());
+        let other = [ToolDefinition { name: "other".to_string(), parameters: None, strict: None }];
+        assert!(try_tool_call_parse_gemma4(msg, Some(&other)).unwrap().0.is_empty());
+    }
+
     #[test]
     fn bare_call_inside_prose_not_recovered() {
         let msg = "To check, use call:get_order_status{awb: \"1\"} with your AWB.";

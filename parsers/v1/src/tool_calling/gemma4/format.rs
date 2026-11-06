@@ -3,8 +3,6 @@
 //
 // Content-cleaning helpers ported from vLLM's gemma4_format.py (SGLang-aligned).
 
-use std::borrow::Cow;
-
 use super::parser::{CALL_PREFIX, STRING_DELIM, TOOL_CALL_END, TOOL_CALL_START};
 
 pub(crate) const CHANNEL_START: &str = "<|channel>";
@@ -554,7 +552,8 @@ pub(crate) const ORPHAN_LABEL_HOLD: usize = 64;
 const LABEL_MAX_JUNK: usize = 4;
 
 fn is_label_junk(c: char) -> bool {
-    !c.is_alphanumeric() && !c.is_whitespace() && c != '<'
+    // `:` is excluded so a real answer opening with `thought:` is never taken for a label.
+    !c.is_alphanumeric() && !c.is_whitespace() && c != '<' && c != ':'
 }
 
 fn alnum_core(text: &str) -> String {
@@ -617,77 +616,229 @@ pub(crate) fn thought_label_end(text: &str) -> Option<usize> {
     }
 }
 
-/// Normalize Gemma 4 output whose thought channel was never opened with `<|channel>`
-/// (no opener before the first `<channel|>`, or no channel markers at all), so the
-/// shared snapshot extraction never sees role labels or dangling markers as content.
-/// Mirrors vLLM's gemma4 parser (bare-`thought` opener injection, `<channel|>`
-/// absorption in content, `thought\n` label stripping) and generalizes it to the
-/// glitched shapes captured from the Exotel leakage suite:
+/// Markers the normalizer acts on. Before the first real `<|channel>`, a stream tail
+/// that is a proper prefix of one of them is held until it resolves, so a marker is
+/// either dropped or emitted whole and the output never has to be taken back.
+const NORMALIZER_MARKERS: &[&str] = &[
+    CHANNEL_START,
+    CHANNEL_END,
+    TOOL_CALL_START,
+    TOOL_CALL_END,
+    STRING_DELIM,
+];
+
+/// Streaming normalizer for Gemma 4 output whose thought channel was never opened
+/// with `<|channel>`, so the snapshot extraction never sees a role label or a dangling
+/// marker as content. Mirrors vLLM's gemma4 parser (bare-`thought` opener injection,
+/// `<channel|>` absorption in content, `thought\n` label stripping) and generalizes it
+/// to the glitched shapes captured from the Exotel leakage suite.
 ///
-/// - `[junk]thought\n[junk]<channel|>answer` or `<channel|>answer` -> empty reasoning,
-///   content `answer`.
-/// - `[junk]thought\n<reasoning><channel|>answer`, reasoning within
-///   [`ORPHAN_LABEL_HOLD`] bytes -> reasoning + content.
-/// - any other `<channel|>` with no opener -> the stray marker is dropped (and a
-///   leading orphan label with it).
-/// - `[junk]thought\n<text>` with no `<channel|>` -> orphan label stripped.
-/// - `<tool_call|>` / `<|"|>` with no tool-call start anywhere -> dropped.
+/// The start of the output is held until it is classified, once:
 ///
-/// Output that opens its channel properly is returned unchanged.
-pub(crate) fn normalize_opener_less(text: &str) -> Cow<'_, str> {
-    let opener_less = match (text.find(CHANNEL_START), text.find(CHANNEL_END)) {
-        (Some(s), Some(e)) => e < s,
-        (Some(_), None) => false,
-        (None, _) => true,
-    };
-    if !opener_less {
-        return Cow::Borrowed(text);
-    }
-
-    let mut s: Cow<'_, str> = Cow::Borrowed(text);
-    let has_call_start = s.contains(TOOL_CALL_START) || tool_call_markup_start(&s).is_some();
-    if !has_call_start && (s.contains(TOOL_CALL_END) || s.contains(STRING_DELIM)) {
-        s = Cow::Owned(s.replace(TOOL_CALL_END, "").replace(STRING_DELIM, ""));
-    }
-
-    if let Some(idx) = s.find(CHANNEL_END) {
-        let prefix = &s[..idx];
-        let after = &s[idx + CHANNEL_END.len()..];
-        if prefix.len() <= LABEL_WINDOW && matches!(alnum_core(prefix).as_str(), "" | TH_WORD) {
-            return Cow::Owned(format!("{CHANNEL_START}{THOUGHT_PREFIX}{CHANNEL_END}{after}"));
-        }
-        let label = thought_label_end(prefix);
-        if let Some(e) = label
-            && idx - e <= ORPHAN_LABEL_HOLD
-        {
-            let reasoning = &prefix[e..];
-            return Cow::Owned(format!(
-                "{CHANNEL_START}{THOUGHT_PREFIX}{reasoning}{CHANNEL_END}{after}"
-            ));
-        }
-        let body = label.map_or(&s[..], |e| &s[e..]);
-        return Cow::Owned(body.replace(CHANNEL_END, ""));
-    }
-
-    if let Some(e) = thought_label_end(&s) {
-        return Cow::Owned(s[e..].to_string());
-    }
-    s
+/// - `[junk]thought\n[junk]<channel|>answer` or `<channel|>answer` (label-only prefix
+///   within [`LABEL_WINDOW`]) -> empty thought block, content `answer`.
+/// - `[junk]thought\n<reasoning><channel|>answer`, `<channel|>` within
+///   [`ORPHAN_LABEL_HOLD`] bytes of the label -> reasoning + content.
+/// - a label not followed by `<channel|>`/`<|channel>` within that window -> the
+///   orphan label is dropped.
+/// - anything else -> left as is.
+///
+/// After that, until the first real `<|channel>` (from which point everything passes
+/// through untouched): a `<channel|>` with no opener is dropped, and `<tool_call|>` /
+/// `<|"|>` are dropped unless a tool call (`<|tool_call>` or `call:`) started before
+/// them.
+///
+/// Every rule depends only on the text before the point it applies to, so the output
+/// is append-only and identical however the input is chunked: streaming never has to
+/// retract emitted text and both modes classify the same output the same way. Each
+/// byte is examined once (O(total) over a stream).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OpenerLessNormalizer {
+    /// Raw input not processed yet (a held partial marker).
+    pending: String,
+    /// Cleaned text before the start is classified.
+    held: String,
+    /// Normalized output; only ever appended to.
+    out: String,
+    decided: bool,
+    /// A real `<|channel>` was seen: everything after it passes through.
+    channel_seen: bool,
+    /// A tool call started (`<|tool_call>` or `call:`): tool grammar after it is kept.
+    call_seen: bool,
+    /// Last few plain bytes, to spot a `call:` split across segments.
+    plain_tail: String,
+    /// Byte offset of the first `<|channel>` in `out` (real or synthesized).
+    first_channel: Option<usize>,
 }
 
-/// Streaming: true while an opener-less output could still resolve into a role label
-/// or an empty thought block, so nothing must be emitted yet. Covers whitespace/junk
-/// only, a partial `thought` word, and a complete label still waiting (up to
-/// [`ORPHAN_LABEL_HOLD`] bytes) for its `<channel|>`. `text` should already have any
-/// trailing incomplete marker stripped.
-pub(crate) fn opener_less_undecided(text: &str) -> bool {
-    if text.contains(CHANNEL_START) || text.contains(CHANNEL_END) {
-        return false;
+impl OpenerLessNormalizer {
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
-    if text.len() <= LABEL_WINDOW && TH_WORD.starts_with(alnum_core(text).as_str()) {
+
+    /// Normalize a complete (non-streaming) output.
+    pub(crate) fn normalize_all(text: &str) -> String {
+        let mut n = Self::new();
+        n.push(text);
+        n.finish();
+        n.out
+    }
+
+    pub(crate) fn push(&mut self, text: &str) {
+        self.pending.push_str(text);
+        self.advance(false);
+    }
+
+    /// End of stream: release held bytes (a partial marker is plain text now).
+    pub(crate) fn finish(&mut self) {
+        self.advance(true);
+    }
+
+    /// Normalized output so far. Empty until the start is classified.
+    pub(crate) fn output(&self) -> &str {
+        &self.out
+    }
+
+    pub(crate) fn is_decided(&self) -> bool {
+        self.decided
+    }
+
+    /// Byte offset of the first `<|channel>` in [`Self::output`].
+    pub(crate) fn first_channel_start(&self) -> Option<usize> {
+        self.first_channel
+    }
+
+    fn advance(&mut self, at_end: bool) {
+        let pending = std::mem::take(&mut self.pending);
+        let mut i = 0usize;
+        while i < pending.len() {
+            let rest = &pending[i..];
+            if self.channel_seen {
+                self.out.push_str(rest);
+                i = pending.len();
+                break;
+            }
+            let Some(lt) = rest.find('<') else {
+                self.push_plain(rest);
+                i = pending.len();
+                break;
+            };
+            self.push_plain(&rest[..lt]);
+            i += lt;
+            let rest = &pending[i..];
+            if let Some(marker) = NORMALIZER_MARKERS.iter().find(|m| rest.starts_with(**m)) {
+                self.on_marker(marker);
+                i += marker.len();
+            } else if !at_end && NORMALIZER_MARKERS.iter().any(|m| m.starts_with(rest)) {
+                break;
+            } else {
+                self.push_plain("<");
+                i += 1;
+            }
+        }
+        self.pending = pending[i..].to_string();
+
+        if !self.decided && (at_end || !start_undecided(&self.held)) {
+            self.decide(None);
+        }
+    }
+
+    fn sink(&mut self) -> &mut String {
+        if self.decided { &mut self.out } else { &mut self.held }
+    }
+
+    fn push_plain(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        if !self.call_seen {
+            let mut window = std::mem::take(&mut self.plain_tail);
+            window.push_str(s);
+            if window.contains(CALL_PREFIX) {
+                self.call_seen = true;
+            } else {
+                let mut cut = window.len().saturating_sub(CALL_PREFIX.len() - 1);
+                while !window.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                self.plain_tail = window[cut..].to_string();
+            }
+        }
+        self.sink().push_str(s);
+    }
+
+    fn push_channel_start(&mut self) {
+        if self.first_channel.is_none() {
+            self.first_channel = Some(self.out.len());
+        }
+        self.out.push_str(CHANNEL_START);
+    }
+
+    fn on_marker(&mut self, marker: &'static str) {
+        match marker {
+            CHANNEL_START | CHANNEL_END if !self.decided => self.decide(Some(marker)),
+            CHANNEL_START => {
+                self.channel_seen = true;
+                self.push_channel_start();
+            }
+            CHANNEL_END => {} // no opener before it: never client-visible
+            TOOL_CALL_START => {
+                self.call_seen = true;
+                self.sink().push_str(marker);
+            }
+            _ if self.call_seen => self.sink().push_str(marker),
+            _ => {} // orphan `<tool_call|>` / `<|"|>` with no call before it
+        }
+    }
+
+    /// Classify the held start. `marker` is the `<|channel>` / `<channel|>` that ended
+    /// the hold, or `None` when the hold expired or the stream ended.
+    fn decide(&mut self, marker: Option<&'static str>) {
+        self.decided = true;
+        let held = std::mem::take(&mut self.held);
+        let label = thought_label_end(&held);
+        let orphan_label = label.filter(|e| marker.is_none() || held.len() - e > ORPHAN_LABEL_HOLD);
+        match marker {
+            Some(CHANNEL_END)
+                if held.len() <= LABEL_WINDOW
+                    && matches!(alnum_core(&held).as_str(), "" | TH_WORD) =>
+            {
+                self.push_channel_start();
+                self.out.push_str(THOUGHT_PREFIX);
+                self.out.push_str(CHANNEL_END);
+            }
+            Some(CHANNEL_END) if label.is_some() && orphan_label.is_none() => {
+                let e = label.unwrap_or_default();
+                self.push_channel_start();
+                self.out.push_str(THOUGHT_PREFIX);
+                self.out.push_str(&held[e..]);
+                self.out.push_str(CHANNEL_END);
+            }
+            _ => {
+                self.out.push_str(&held[orphan_label.unwrap_or(0)..]);
+                if marker == Some(CHANNEL_START) {
+                    self.on_marker(CHANNEL_START);
+                }
+                // A `<channel|>` here has no opener and no label to pair with: dropped.
+            }
+        }
+    }
+}
+
+/// True while the cleaned start of an output could still resolve into a role label or
+/// an empty thought block: whitespace/junk only, a partial `thought` word, or a complete
+/// label still waiting (up to [`ORPHAN_LABEL_HOLD`] bytes) for its `<channel|>`.
+fn start_undecided(held: &str) -> bool {
+    if held.len() <= LABEL_WINDOW && TH_WORD.starts_with(alnum_core(held).as_str()) {
         return true;
     }
-    thought_label_end(text).is_some_and(|e| text.len() - e <= ORPHAN_LABEL_HOLD)
+    thought_label_end(held).is_some_and(|e| held.len() - e <= ORPHAN_LABEL_HOLD)
+}
+
+/// Length of the prefix of `text` that cannot be the start of a split control token.
+pub(crate) fn safe_prefix_len(text: &str) -> usize {
+    let cut = text.len() - longest_incomplete_suffix_len(text);
+    if text.is_char_boundary(cut) { cut } else { text.len() }
 }
 
 /// Client-visible content pipeline: empty-thinking suppression + tool-suffix strip.
