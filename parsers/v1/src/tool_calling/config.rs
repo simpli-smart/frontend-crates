@@ -855,9 +855,23 @@ impl ToolCallConfig {
             tool_call_ban_tokens: vec!["｜DSML｜".to_string()],
             reasoning_end: Some("</think>".to_string()),
         });
+        // The parameter grammar is `JsonSchemaStyle::DeepseekXml`, which xgrammar renders with the
+        // V3.2 / V4 tags (`<｜DSML｜parameter name=...>`, `</｜DSML｜parameter>`) and cannot be
+        // given a separator. A non-empty `sep` (V4.1: `<｜DSML｜ parameter name=...>`) would then
+        // build a grammar that mixes spaced block/invoke tags with unspaced parameter tags, which
+        // is not what the model was trained to emit. With structural tags default-on, that forces
+        // the model off-format: first parameters come out unspaced or are dropped, and the
+        // turn does not end after the call (tool turns run to `max_tokens`). Provide no builder
+        // for the spaced variant so the backend decodes unconstrained and the DSML parser reads
+        // the model's own output.
+        let structural_tag_builder = if sep.is_empty() {
+            Some(structural_tag)
+        } else {
+            None
+        };
         Self {
             parser_config: ParserConfig::Dsml(dsml_config),
-            structural_tag_builder: Some(structural_tag),
+            structural_tag_builder,
         }
     }
 

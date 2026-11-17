@@ -774,6 +774,34 @@ fn dsml_required_starting_in_reasoning_wraps_tool_calls_in_sequence() {
     );
 }
 
+/// DeepSeek V4.1 uses spaced tags (`<｜DSML｜ calls>`, `<｜DSML｜ parameter name=`), but the only
+/// DeepSeek parameter style the grammar backend has is the unspaced V3.2 / V4 one
+/// (`JsonSchemaStyle::DeepseekXml`). A V4.1 builder would constrain decoding to a format the
+/// model never emits, so the spaced variants must not provide one (the parser still works).
+#[test]
+fn deepseek_v41_has_no_structural_tag_builder() {
+    assert!(
+        ToolCallConfig::deepseek_v41()
+            .structural_tag_builder
+            .is_none(),
+        "deepseek_v41 must not build a structural tag: DeepseekXml cannot express spaced tags"
+    );
+}
+
+/// The unspaced variants keep their builder: the V4.1 change must not leak into V3.2 / V4.
+#[test]
+fn unspaced_deepseek_dsml_configs_keep_structural_tag_builder() {
+    for (name, config) in [
+        ("deepseek_v3_2", ToolCallConfig::deepseek_v3_2()),
+        ("deepseek_v4", ToolCallConfig::deepseek_v4()),
+    ] {
+        assert!(
+            config.structural_tag_builder.is_some(),
+            "{name} should still provide a structural tag builder"
+        );
+    }
+}
+
 #[test]
 fn deepseek_v4_config_builds_tool_calls_block() {
     let tools = sample_tools();
